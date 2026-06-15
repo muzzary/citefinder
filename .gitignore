@@ -1,0 +1,14 @@
+﻿# Python
+venv/
+__pycache__/
+*.pyc
+
+# Environment / secrets
+.env
+
+# Test data (don't commit your FYP PDF)
+*.pdf
+
+# OS
+Thumbs.db
+.DS_Store
