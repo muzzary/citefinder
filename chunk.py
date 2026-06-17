@@ -22,18 +22,20 @@ def chunk_pages(pages, source_id, user_id="user_1", chunk_size=1200, overlap=300
             chunk_text = text[start:end].strip()
 
             if chunk_text:  # skip empty fragments
-                # NEW: skip table-of-contents / dotted-line junk
+                # skip table-of-contents / dotted-line junk
                 dot_ratio = chunk_text.count(".") / max(len(chunk_text), 1)
-                if dot_ratio > 0.25:      # >25% dots = a TOC/index line
-                    start = end - overlap
-                    continue
+                if dot_ratio <= 0.25:     # >25% dots = a TOC/index line
+                    chunks.append({
+                        "source_id": source_id,
+                        "user_id": user_id,
+                        "page_number": page["page_number"],
+                        "chunk_text": chunk_text,
+                    })
 
-                chunks.append({
-                    "source_id": source_id,
-                    "user_id": user_id,
-                    "page_number": page["page_number"],
-                    "chunk_text": chunk_text,
-                })
+            # The slice already covered the rest of the page: stop here so we
+            # don't emit a near-duplicate tail chunk (the leftover < overlap).
+            if end >= len(text):
+                break
 
             # move forward, but step back by `overlap` so chunks overlap
             start = end - overlap
@@ -45,7 +47,7 @@ def chunk_pages(pages, source_id, user_id="user_1", chunk_size=1200, overlap=300
 if __name__ == "__main__":
     from ingest import extract_pdf_pages
 
-    pages = extract_pdf_pages("fyp_final.pdf")
+    pages = extract_pdf_pages("data/fyp_final.pdf")
     chunks = chunk_pages(pages, source_id=1)
 
     print(f"Total chunks created: {len(chunks)}")

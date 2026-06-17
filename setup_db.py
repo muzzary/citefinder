@@ -1,40 +1,110 @@
-import psycopg
-
-CONN = "host=localhost dbname=citefinder user=postgres password=devpass"
+from db import connect
 
 def setup():
-    conn = psycopg.connect(CONN)
-    cur = conn.cursor()
+    with connect() as conn, conn.cursor() as cur:
+        # sources table: one row per uploaded PDF.
+        #   kind      = 'work' (a citable publication) or 'notes' (the
+        #               student's own / mixed-origin material). See ADR 0001/0003.
+        #   confirmed = the student has verified this Work's metadata, so a
+        #               formatted Citation may be offered. Until then attribution
+        #               is Locator-only. See ADR 0003.
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS sources (
+                id SERIAL PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                title TEXT,
+                author TEXT,
+                year TEXT,
+                filename TEXT,
+                metadata_complete BOOLEAN DEFAULT FALSE,
+                kind TEXT NOT NULL DEFAULT 'work',
+                confirmed BOOLEAN NOT NULL DEFAULT FALSE
+            );
+        """)
 
-    # sources table: one row per uploaded PDF (metadata for citations)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS sources (
-            id SERIAL PRIMARY KEY,
-            user_id TEXT NOT NULL,
-            title TEXT,
-            author TEXT,
-            year TEXT,
-            filename TEXT,
-            metadata_complete BOOLEAN DEFAULT FALSE
-        );
-    """)
+        # Migration for databases created before kind/confirmed existed.
+        cur.execute("ALTER TABLE sources ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'work';")
+        cur.execute("ALTER TABLE sources ADD COLUMN IF NOT EXISTS confirmed BOOLEAN NOT NULL DEFAULT FALSE;")
 
-    # chunks table: many rows per source, each with its vector + page
-    # vector(384) MUST match the embedding model's output size
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS chunks (
-            id SERIAL PRIMARY KEY,
-            source_id INTEGER REFERENCES sources(id),
-            user_id TEXT NOT NULL,
-            page_number INTEGER,
-            chunk_text TEXT,
-            embedding vector(384)
-        );
-    """)
+        # chunks table: many rows per source, each with its vector + page
+        # vector(384) MUST match the embedding model's output size
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS chunks (
+                id SERIAL PRIMARY KEY,
+                source_id INTEGER REFERENCES sources(id) ON DELETE CASCADE,
+                user_id TEXT NOT NULL,
+                page_number INTEGER,
+                chunk_text TEXT,
+                embedding vector(384)
+            );
+        """)
 
-    conn.commit()
-    conn.close()
-    print("Tables created: sources, chunks")
+        # Full-text search column for the keyword half of hybrid retrieval
+        # (Phase 6). A GENERATED STORED tsvector stays in sync with chunk_text
+        # automatically — it back-fills existing rows on creation and updates on
+        # every insert/update, so no application code has to maintain it.
+        # The GIN index makes ts_rank / @@ lookups fast. See ADR 0003 / CLAUDE.md.
+        cur.execute("""
+            ALTER TABLE chunks ADD COLUMN IF NOT EXISTS text_tsv tsvector
+            GENERATED ALWAYS AS (to_tsvector('english', coalesce(chunk_text, '')))
+            STORED;
+        """)
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS chunks_text_tsv_idx "
+            "ON chunks USING GIN (text_tsv);"
+        )
+
+        # chats: a chat OWNS the corpus added to it (see ADR 0005). Sources are
+        # scoped to a chat via chat_id, so a question searches only that chat's
+        # folder/files — not everything the user ever uploaded.
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS chats (
+                id SERIAL PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                title TEXT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+        """)
+
+        # messages: the Q&A history of a chat, so the sidebar can replay it.
+        # attribution holds the Locators/Citations shown with an assistant turn
+        # (stored, not re-derived, so a replay is exactly what the student saw).
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS messages (
+                id SERIAL PRIMARY KEY,
+                chat_id INTEGER NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                attribution JSONB,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+        """)
+
+        # Scope sources to a chat. Nullable so pre-chat / eval sources (scoped by
+        # user_id) keep working; new app ingests set it.
+        cur.execute("ALTER TABLE sources ADD COLUMN IF NOT EXISTS chat_id INTEGER REFERENCES chats(id);")
+        cur.execute("CREATE INDEX IF NOT EXISTS sources_chat_id_idx ON sources(chat_id);")
+
+        # Make deletes cascade at the DB layer so deleting a chat removes its
+        # corpus + history atomically (chat -> its sources -> their chunks, and
+        # chat -> its messages). delete_chat then only deletes the chat row, and
+        # a future child table can't be silently orphaned by a stale manual
+        # delete order. Idempotent: re-point the FKs to ON DELETE CASCADE.
+        # (CREATE TABLE above already sets this for fresh DBs; these ALTERs
+        # upgrade databases created before the cascade existed.)
+        for table, col, ref in (
+            ("chunks", "source_id", "sources(id)"),
+            ("messages", "chat_id", "chats(id)"),
+            ("sources", "chat_id", "chats(id)"),
+        ):
+            constraint = f"{table}_{col}_fkey"
+            cur.execute(f"ALTER TABLE {table} DROP CONSTRAINT IF EXISTS {constraint};")
+            cur.execute(
+                f"ALTER TABLE {table} ADD CONSTRAINT {constraint} "
+                f"FOREIGN KEY ({col}) REFERENCES {ref} ON DELETE CASCADE;"
+            )
+
+    print("Tables created: sources, chunks, chats, messages (+ indexes, cascade FKs)")
 
 if __name__ == "__main__":
     setup()

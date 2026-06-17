@@ -28,7 +28,7 @@ def extract_pdf_pages(pdf_path):
 
 # --- quick test (run this file directly) ---
 if __name__ == "__main__":
-    path = "fyp_final.pdf"   # put a PDF named sample.pdf in this folder, or change this path
+    path = "data/fyp_final.pdf"   # sample PDFs live in data/; change this path as needed
     pages = extract_pdf_pages(path)
 
     total = len(pages)
