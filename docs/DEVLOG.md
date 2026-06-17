@@ -6,7 +6,7 @@ and the ADRs (`0001`–`0004`).
 
 ---
 
-## 2026-06-17 — UI additions: rename/delete chat, files-in-chat, slim Locators
+## UI additions: rename/delete chat, files-in-chat, slim Locators
 
 ### 1. What was done
 
@@ -46,7 +46,7 @@ Three requested UI improvements, with their backend support.
 
 ---
 
-## 2026-06-17 — LLM endpoint made env-configurable (hosted opt-in, e.g. Groq)
+## LLM endpoint made env-configurable (hosted opt-in, e.g. Groq)
 
 ### 1. What was done
 
@@ -84,7 +84,7 @@ zero LLM tokens regardless.
 
 ---
 
-## 2026-06-17 — Phase 8: web UI (FastAPI + vanilla SPA)
+## Phase 8: web UI (FastAPI + vanilla SPA)
 
 ### 1. What was done
 
@@ -153,7 +153,7 @@ source". Built as a thin web layer over the existing pipeline (no new logic).
 
 ---
 
-## 2026-06-17 — Cite-on-demand: confirm locks a Source, cite renders any style
+## Cite-on-demand: confirm locks a Source, cite renders any style
 
 ### 1. What was done
 
@@ -201,7 +201,7 @@ code from confirmed facts only).
 
 ---
 
-## 2026-06-17 — Folder ingest: "add a folder", non-blocking, into a chat
+## Folder ingest: "add a folder", non-blocking, into a chat
 
 ### 1. What was done
 
@@ -245,7 +245,7 @@ confirm-later).
 
 ---
 
-## 2026-06-17 — Chat scoping: a chat owns its corpus (toward the UI vision)
+## Chat scoping: a chat owns its corpus (toward the UI vision)
 
 ### 1. What was done
 
@@ -303,7 +303,7 @@ None — built clean. (One care point: `messages.attribution` written via
 
 ---
 
-## 2026-06-17 — Housekeeping: repository layout
+## Housekeeping: repository layout
 
 Tidied the flat root for easier navigation (light-touch — Python source stays in
 root so run commands are unchanged):
@@ -321,7 +321,7 @@ root so run commands are unchanged):
 
 ---
 
-## 2026-06-17 — Phase 7 evaluation: measured the upgrades, tuned the placeholders
+## Phase 7 evaluation: measured the upgrades, tuned the placeholders
 
 ### 1. What was done
 
@@ -427,7 +427,7 @@ coverage gate in `answer`), `DEVLOG.md` (this entry), `CLAUDE.md` (Phase 7).
 
 ---
 
-## 2026-06-17 — Phase 6 retrieval upgrade: multi-query + hybrid (RRF)
+## Phase 6 retrieval upgrade: multi-query + hybrid (RRF)
 
 ### 1. What was done
 
@@ -584,7 +584,7 @@ rewired `answer`), `DEVLOG.md` (this entry), `CLAUDE.md` (Phase 6 marked built).
 
 ---
 
-## 2026-06-16 — Locate-by-default redesign + first build
+## Locate-by-default redesign + first build
 
 ### 1. What was done
 
