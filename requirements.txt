@@ -1,0 +1,10 @@
+# CiteFinder runtime dependencies (install into a venv).
+fastapi
+uvicorn
+pydantic
+psycopg[binary]
+pgvector
+sentence-transformers
+pypdf
+openai
+python-dotenv
