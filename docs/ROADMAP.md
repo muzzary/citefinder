@@ -102,11 +102,18 @@ is built until these hold.
 
 ## Later (deferred — recorded for context, not in current scope)
 
-- **Phase 15 — Native window (`pywebview`).** Launch FastAPI on a private
-  loopback port inside a native window; app icon/title; closing the window stops
-  the server and Postgres; single-instance focuses the existing window.
-- **Phase 16 — Packaging (PyInstaller, Windows).** Bundle app + Python + portable
-  Postgres + pgvector + ONNX model into a Windows installer; first-run `initdb`;
-  document the SmartScreen "Run anyway" step; smoke-test on a clean profile.
+- **Phase 15 — Native window (`pywebview`).** ✅ done. `desktop.py` boots the
+  bundled Postgres, serves FastAPI on a private loopback port (`:8765`), and opens
+  a native window (Edge WebView2); closing it stops the server and Postgres.
+  Single-instance: exits if already serving (focus-existing is a later refinement).
+  Server path + clean shutdown verified headlessly (DEVLOG T35); the window render
+  is run interactively (`python desktop.py`).
+- **Phase 16 — Packaging (PyInstaller, Windows).** ✅ done. `CiteFinder.spec`
+  (PyInstaller onedir bundling app + `web/` + portable Postgres + pgvector + the e5
+  model) + `CiteFinder.iss` (Inno Setup one-click, per-user). Output:
+  `installer/CiteFinder-Setup-1.0.0.exe` (328 MB). First-run `initdb` via
+  `pgserver`. Verified the frozen bundle runs end-to-end (DEVLOG T36). Fixed two
+  windowed-mode packaging bugs (no-console stdout; `pg_ctl` pipe hang). SmartScreen
+  "Run anyway" (unsigned) + a clean-profile smoke test remain for Phase 17.
 - **Phase 17 — Docs + demo.** Rewrite README install to "download & run"; DEVLOG
   entries per phase; screenshots / short demo.

@@ -17,3 +17,13 @@ Thumbs.db
 # portable Postgres, the compiled pgvector, and download archives.
 vendor/
 *.zip
+
+run_citefinder.bat
+
+# PyInstaller (Phase 16)
+build/
+dist/
+
+# Inno Setup output (Phase 16)
+installer/
+*.log

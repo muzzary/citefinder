@@ -75,8 +75,15 @@ def is_running() -> bool:
         return s.connect_ex((PG_HOST, PG_PORT)) == 0
 
 
+# Windows pops a console window for each console child (pg_ctl/initdb) launched
+# from the windowed desktop app. CREATE_NO_WINDOW suppresses that flash. 0 on
+# non-Windows / older Pythons.
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
 def _run(args, **kw):
-    return subprocess.run(args, capture_output=True, text=True, **kw)
+    return subprocess.run(args, capture_output=True, text=True,
+                          creationflags=_NO_WINDOW, **kw)
 
 
 def initdb_if_needed() -> bool:
@@ -116,11 +123,19 @@ def start():
         return
     initdb_if_needed()
     _clear_stale_pid()
-    r = _pg_ctl("-o", f"-p {PG_PORT}", "-l", str(_log_file()), "-w",
-                "-t", str(_READY_TIMEOUT), "start")
+    # IMPORTANT: do NOT capture pg_ctl's output via a pipe. `pg_ctl start` spawns
+    # the long-lived postgres daemon, which inherits the pipe handles and never
+    # closes them, so subprocess.run(capture_output=True) would block forever
+    # waiting for EOF (hangs the whole app in a frozen/windowed build). Send to
+    # DEVNULL; the server's own log still goes to the -l logfile.
+    r = subprocess.run(
+        [_bin("pg_ctl"), "-D", str(data_dir()), "-o", f"-p {PG_PORT}",
+         "-l", str(_log_file()), "-w", "-t", str(_READY_TIMEOUT), "start"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        creationflags=_NO_WINDOW,
+    )
     if r.returncode != 0 and not is_running():
-        raise RuntimeError(f"pg_ctl start failed:\n{r.stdout}\n{r.stderr}\n"
-                           f"see log: {_log_file()}")
+        raise RuntimeError(f"pg_ctl start failed (rc={r.returncode}); see log: {_log_file()}")
     deadline = time.monotonic() + _READY_TIMEOUT
     while time.monotonic() < deadline:
         if is_running():
