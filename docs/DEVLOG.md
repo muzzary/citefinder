@@ -6,6 +6,81 @@ and the ADRs (`0001`–`0007`).
 
 ---
 
+## Phase 16 — packaging: PyInstaller bundle + Inno Setup installer
+
+### 1. What was done
+
+Packaged CiteFinder into a single one-click Windows installer that bundles
+EVERYTHING except the LLM (ADR 0007): the app + `web/` UI, the portable
+PostgreSQL 16.9 + MSVC-built pgvector 0.8.3 (from `vendor/`), and the e5 ONNX
+model — so a fresh install ingests/embeds/retrieves fully offline; only the answer
+LLM is configured at runtime (cloud key or local Ollama). No API key is shipped.
+
+- `CiteFinder.spec` — PyInstaller onedir. `collect_all` for the native/data-heavy
+  deps (onnxruntime, tokenizers, pywebview/pythonnet, psycopg, uvicorn…); bundles
+  `web/`, the model (flat `model/`), and the whole `pgsql/` tree as datas.
+- `embedder.py` loads the model from a bundled path (`sys._MEIPASS/model` or
+  `CITEFINDER_MODEL_DIR`) before falling back to the HF hub — offline in the bundle.
+- `CiteFinder.iss` — Inno Setup, per-user install (no admin), Start-menu + optional
+  desktop shortcut, LZMA2 solid compression.
+- Output: `installer/CiteFinder-Setup-1.0.0.exe`, **328 MB** (from a 1.15 GB onedir).
+
+Three packaging bugs found and fixed (all windowed-mode only):
+- **No-console stdout**: a windowed PyInstaller build has `sys.stdout/stderr = None`,
+  which crashed uvicorn's log formatter (`sys.stdout.isatty()`) and any `print()`.
+  `desktop.py` now redirects both to `app-data/app.log` when there's no console.
+- **`pg_ctl start` hang**: the long-lived `postgres` daemon inherited the captured
+  stdout pipe, so `subprocess.run(capture_output=True)` blocked forever waiting for
+  EOF. `pgserver.start()` now sends `pg_ctl`'s output to DEVNULL (the server log
+  still goes to the `-l` logfile).
+- **Console-window flash** (found while testing the installed app): the windowed
+  app shells out to the console program `pg_ctl.exe` to start/stop Postgres, so
+  Windows popped a console window each time. `pgserver` now passes
+  `CREATE_NO_WINDOW` to its subprocess calls. (Needs a repackage to reach an
+  already-installed build.)
+
+### 2. Tests
+
+**T36 — frozen bundle + installer (real bundle on this machine)**
+- Bundled binaries verified directly: `postgres.exe`/`pg_ctl.exe` → 16.9, all 29
+  DLLs present; `vector.dll` + model + `web/` present in the bundle.
+- Staged startup trace of the frozen exe pinned the `pg_ctl` hang, then confirmed
+  the fix: `pg_ctl rc=0` → app imported → uvicorn ready → `webview.start()`.
+- Clean final onedir: **server up in ~12 s; `GET /` and `/api/chats` → 200** —
+  bundled Postgres + pgvector + e5 all functional from the packaged exe.
+- Installer compiled successfully (Inno Setup 6.7.3) → 328 MB.
+- Caveats: install needs ~1.15 GB free (per-user under `%LocalAppData%`); WebView2
+  runtime assumed present (ships with Win10/11 Edge); the exe is unsigned, so first
+  launch shows SmartScreen "Run anyway" (documented for Phase 17).
+
+---
+
+## Phase 15 — native window (pywebview)
+
+### 1. What was done
+
+`desktop.py` — the packaged entry point. Sets `CITEFINDER_PG=bundled`, then on
+launch: boots the app-owned Postgres (via app.py's bootstrap), serves FastAPI on a
+PRIVATE loopback port (`127.0.0.1:8765`, distinct from the dev server's `:8000`) in
+a daemon thread, and opens a native window (pywebview → Edge WebView2 on Windows)
+pointed at it. Closing the window stops the web server and `pgserver.stop()`s the
+database. Single-instance: if the private port is already serving, it exits rather
+than starting a second postmaster over the same data dir. The browser dev flow
+(`python app.py` on `:8000`, Docker) is unchanged.
+
+### 2. Tests
+
+**T35 — launcher lifecycle (headless server path)**
+- `pywebview` installed; WebView2 runtime present (149.0); `py_compile` OK.
+- `build_server()` + `start_server()` → server up on `:8765`; `GET /` → 200 (SPA),
+  `/api/settings` → 200, **`/api/chats` → 200 `[]`** (a DB-backed query, proving
+  the bundled Postgres is wired end-to-end through the launcher).
+- `shutdown()` → server down AND bundled Postgres stopped (clean teardown).
+- The actual window render needs an interactive desktop session, so it is verified
+  by running `python desktop.py` (not in the headless harness).
+
+---
+
 ## Phase 12 — bundled Postgres + pgvector (no Docker)
 
 ### 1. What was done
@@ -295,6 +370,35 @@ documented trade-offs (below).
 - Postcondition: retrieval results unchanged vs the Phase-7 baseline; the ask path
   does one fewer dense scan per covered query (and avoids the original-question
   recompute on expansion); ingest embeds in bounded-memory batches.
+
+---
+
+## Draft new-chat: persist a chat only on first action
+
+### 1. What was done
+
+Starting a new chat used to immediately create a `chats` row, so abandoning it
+left an "Untitled chat with nothing in it" cluttering the sidebar. Made the new
+chat a DRAFT: clicking "Start a new chat" routes to `#/new` and creates nothing;
+the row is persisted lazily on the first real action (add a file or ask a
+question). Frontend-only (`web/app.js`):
+- Router: `#/new` renders the chat view in draft mode (`renderChat(null)`);
+  `startNewChat()` just navigates there.
+- `ensureChat()` creates the chat (and swaps the URL to `#/chat/:id` via
+  `history.replaceState`, refreshing the sidebar) on the first upload/ask only.
+- Header rename/files/delete are guarded while `cid == null` (delete just
+  discards the draft by returning to the list).
+
+### 2. Tests
+
+**T30a — draft new-chat (frontend)**
+- `node --check web/app.js` → syntax OK.
+- Swept the DB for pre-existing empty chats (no messages AND no sources) → 0 found
+  (already clean), so nothing to migrate.
+- Behavioural: opening a new chat and navigating away persists no row; adding a
+  file / asking creates the row then and titles it from the first question.
+- Note: served statically from disk, so it goes live on a browser hard-refresh —
+  no server restart needed.
 
 ---
 

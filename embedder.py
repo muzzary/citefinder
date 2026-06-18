@@ -26,6 +26,10 @@ The model files (`onnx/model.onnx`, `tokenizer.json`) are pulled once from the
 HF hub (the Xenova ONNX mirror) and cached under the app-data dir, so a packaged
 build can pre-seed them there and run fully offline.
 """
+import os
+import sys
+from pathlib import Path
+
 import numpy as np
 import onnxruntime as ort
 from huggingface_hub import hf_hub_download
@@ -50,14 +54,35 @@ def _model_cache_dir():
     return str(d)
 
 
+def _model_files():
+    """Return (onnx_path, tokenizer_path).
+
+    Prefer a BUNDLED model — a flat dir holding `model.onnx` + `tokenizer.json` —
+    from `CITEFINDER_MODEL_DIR` or a PyInstaller bundle (`sys._MEIPASS/model`), so
+    the packaged app runs fully offline (Phase 16). Falls back to pulling from the
+    HF hub (cached under app-data) for dev."""
+    candidates = []
+    env = os.environ.get("CITEFINDER_MODEL_DIR")
+    if env:
+        candidates.append(Path(env))
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        candidates.append(Path(meipass) / "model")
+    for base in candidates:
+        onnx, tok = base / "model.onnx", base / "tokenizer.json"
+        if onnx.exists() and tok.exists():
+            return str(onnx), str(tok)
+    cache = _model_cache_dir()
+    return (hf_hub_download(REPO, filename="onnx/model.onnx", cache_dir=cache),
+            hf_hub_download(REPO, filename="tokenizer.json", cache_dir=cache))
+
+
 def _load():
     """Load the ONNX session + tokenizer once (lazy, process-global)."""
     global _session, _tokenizer, _input_names
     if _session is not None:
         return
-    cache = _model_cache_dir()
-    onnx_path = hf_hub_download(REPO, filename="onnx/model.onnx", cache_dir=cache)
-    tok_path = hf_hub_download(REPO, filename="tokenizer.json", cache_dir=cache)
+    onnx_path, tok_path = _model_files()
 
     tk = Tokenizer.from_file(tok_path)
     tk.enable_truncation(max_length=MAX_LEN)
