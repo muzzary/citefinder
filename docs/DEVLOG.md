@@ -6,6 +6,41 @@ and the ADRs (`0001`–`0007`).
 
 ---
 
+## Citation-aware attribution (Locators reflect the answer, not the pool)
+
+### 1. What was done
+
+A user saw the "Where this comes from" list show 5 pages when the answer only drew
+on one. Root cause: `app.py::_build_attribution` rendered a Locator for EVERY
+chunk in `answer()`'s returned set — i.e. the whole top-5 hybrid RETRIEVAL pool
+(which includes keyword-arm chunks that merely share a term), not the chunks the
+answer actually used.
+
+Fix (`query.answer`): number the source blocks (`[1] [2] …`) in the prompt and
+have the model end with a `USED: 1, 3` line naming only the sources it drew on.
+`_filter_used` strips that line from the displayed answer and keeps only those
+chunks for attribution — with a safe fallback to ALL chunks if the marker is
+missing/unparseable, so attribution is never lost.
+
+### 2. Tests / findings
+
+**T33 — attribution + a stale-server lesson**
+- Unit: `_filter_used("…\nUSED: 1, 3", 5 chunks)` → keeps [1,3], strips the line;
+  missing marker → keeps all 5.
+- End-to-end (real LLM, the real SalesAutomation PDF re-ingested clean with e5):
+  "limitations of sales automation" → grounded answer, **1 Locator (p.18) vs the
+  5 shown before**. e5-on-e5 best distances 0.117–0.127 (well within the 0.22
+  floor) — confirming `MAX_DISTANCE=0.22` is right for real content.
+- **Operational lesson (important):** a long-running `python app.py` serves the
+  code it loaded at start — it does NOT pick up edited modules, and it ingests
+  with the embedder held in memory. So after the e5 swap, the still-running server
+  kept using MiniLM (old floor 0.69, no USED marker) and ingested new uploads as
+  MiniLM vectors; querying those with e5 gave garbage distances (~0.77) and false
+  refusals. **After an embedder change: restart the server AND re-ingest any corpus
+  added by the old process.**
+
+---
+
 ## Embedder upgrade: all-MiniLM-L6-v2 → e5-small-v2
 
 ### 1. What was done

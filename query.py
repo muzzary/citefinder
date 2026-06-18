@@ -88,6 +88,31 @@ def is_refusal(text):
     return len(t) <= 80 or len(sentences) <= 1
 
 
+# Matches the answer's trailing "USED: 1, 3" marker (its own line, small prefix ok).
+_USED_RE = re.compile(r"(?im)^[^\n]*\bused\s*[:=\-]\s*([0-9][0-9,\s]*)\s*$")
+
+
+def _filter_used(text, chunks):
+    """
+    The grounded answer ends with a 'USED: 1, 3' line naming the bracketed source
+    numbers it actually drew on (see the answer prompt). Strip that line from what
+    the student sees, and keep ONLY those chunks for attribution — so the "where
+    this comes from" Locators reflect what the answer used, not the whole retrieved
+    pool (which includes keyword-arm chunks that merely share a term).
+
+    Robust by design: if the marker is missing/unparseable, or names nothing valid,
+    fall back to ALL chunks — attribution is never silently lost. Returns
+    (clean_text, used_chunks).
+    """
+    m = _USED_RE.search(text or "")
+    if not m:
+        return text, chunks
+    clean = _USED_RE.sub("", text).strip()
+    idxs = {int(n) for n in re.findall(r"\d+", m.group(1))}
+    used = [c for i, c in enumerate(chunks, 1) if i in idxs]
+    return (clean, used) if used else (clean, chunks)
+
+
 # --- Retrieval tuning, SET FROM EVALUATION (evaluate.py --tune-floor), not guessed.
 # MAX_DISTANCE: dense coverage floor. RE-TUNED for the e5-small-v2 embedder (T32):
 #   e5's cosine distances live on a far smaller scale than MiniLM's (covered best
@@ -609,10 +634,11 @@ def answer(question, user_id="user_1", top_k=5, expand="auto", chat_id=None):
     if not chunks:
         return REFUSAL, []
 
-    # build the context block the LLM will read, with source+page labels
+    # build the context block the LLM will read, with NUMBERED source+page labels
+    # so the model can tell us which sources it actually used (see _filter_used).
     context = "\n\n".join(
-        f"[Source: {c['source']}, page {c['page']}]\n{c['text']}"
-        for c in chunks
+        f"[{i}] Source: {c['source']}, page {c['page']}\n{c['text']}"
+        for i, c in enumerate(chunks, 1)
     )
 
     system_prompt = (
@@ -623,8 +649,11 @@ def answer(question, user_id="user_1", top_k=5, expand="auto", chat_id=None):
         "what they cover and say plainly what they do not. If the sources do not "
         "address the question at all, reply with EXACTLY this sentence and "
         f"nothing else, word for word: {REFUSAL} "
-        "Do NOT list sources, file names, or page numbers yourself — that is "
-        "handled separately."
+        "Do NOT list sources, file names, or page numbers in your explanation — "
+        "that is handled separately. BUT on the very last line, output exactly "
+        "'USED:' followed by the bracketed numbers of ONLY the sources you actually "
+        "drew on, comma-separated (e.g. 'USED: 1, 3'). This line is metadata, not "
+        "part of the explanation."
     )
 
     user_prompt = f"SOURCES:\n{context}\n\nQUESTION: {question}"
@@ -639,14 +668,17 @@ def answer(question, user_id="user_1", top_k=5, expand="auto", chat_id=None):
         temperature=0.0,  # factual, deterministic
     )
 
-    out = response.choices[0].message.content
+    # Strip the USED: marker from what the student sees, and keep only the sources
+    # the answer actually used for attribution (so Locators reflect the answer, not
+    # the whole retrieved pool). Falls back to all chunks if the marker is missing.
+    out, used = _filter_used(response.choices[0].message.content or "", chunks)
     # LLM-backstop refusal: if the model refused despite being handed chunks,
     # normalise to the canonical refusal with NO attribution, so callers never
     # attach Locators to a non-answer (the structural refusals above already
     # return []). is_refusal is robust to the model rewording the refusal.
     if is_refusal(out):
         return REFUSAL, []
-    return out, chunks
+    return out, used
 
 
 # --- test ---
