@@ -6,6 +6,45 @@ and the ADRs (`0001`–`0007`).
 
 ---
 
+## Phase 12 — bundled Postgres + pgvector (no Docker)
+
+### 1. What was done
+
+Stood up CiteFinder's own PostgreSQL so the desktop app needs no Docker / system
+install (ADR 0006/0007). The Phase-9b blocker — "no MSVC to build pgvector on
+Windows" — is GONE: this machine now has Visual Studio Community 2026, so pgvector
+builds from source.
+
+- **Built pgvector 0.8.3** against portable PostgreSQL 16.9 (EDB binaries) with
+  MSVC (`nmake /F Makefile.win`). Binaries vendored under `vendor/` (gitignored).
+- **`pgserver.py`** — lifecycle manager: `initdb` once into the app-data dir
+  (guarded by PG_VERSION — never over an existing cluster), start/stop on a private
+  loopback port (54329, trust auth — no network surface), single-instance via a TCP
+  probe, `ensure_ready()` (start → create DB + `CREATE EXTENSION vector` → run
+  `setup_db`), and conservative crash recovery (clear only a stale `postmaster.pid`,
+  never touch data). CLI: `python pgserver.py {start|stop|status|ensure}`.
+- **`app.py`** boots the bundled cluster before importing `db` when
+  `CITEFINDER_PG=bundled`; dev still defaults to Docker (ROADMAP: dev keeps Docker
+  until packaging).
+
+### 2. Tests
+
+**T34 — bundled Postgres end-to-end (no Docker)**
+- Spike: created DB + `vector` extension (0.8.3) + schema, ingested chunks, vector
+  retrieve (distances 0.131/0.179) and a grounded `answer()` — all against the
+  portable cluster, Docker stopped-irrelevant.
+- Lifecycle: `status`/`stop`/`ensure`/`start` all correct; `ensure` creates DB +
+  extension + migrates.
+- **Crash recovery**: hard-killed the postmaster (stale `postmaster.pid` left, port
+  down) → `pgserver.py start` cleared the stale pid and recovered (accepting
+  connections).
+- Wiring: `CITEFINDER_PG=bundled` → `db.CONN` resolves to `:54329`; unset →
+  Docker default unchanged. `py_compile` on `app.py`/`pgserver.py` → OK.
+- Note: portable PG + the MSVC-built pgvector are vendored locally (gitignored);
+  PyInstaller bundles them in Phase 16.
+
+---
+
 ## Citation-aware attribution (Locators reflect the answer, not the pool)
 
 ### 1. What was done

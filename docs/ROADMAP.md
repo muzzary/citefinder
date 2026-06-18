@@ -44,14 +44,11 @@ is built until these hold.
   **Phase-11 note:** use `tokenizers.Tokenizer`, *not* `transformers.AutoTokenizer`
   — the latter transitively imports torch; `tokenizers`/`onnxruntime`/`hf_hub`
   do not.
-- **9b — deferred to Phase 12 (decision, not failure).** pgvector ships no
-  official Windows binary and this machine has no MSVC compiler, so the
-  extension must be built once with MSVC (`nmake /F Makefile.win`) on a build
-  machine / CI and the resulting files bundled — *known effort, not unknown
-  feasibility*. Phases 10 and 11 don't need a bundled Postgres (dev keeps using
-  the Docker instance), so the actual bundling proof (compile-vs-prebuilt) is
-  taken up at Phase 12 with more context. SQLite + `sqlite-vec` remains the
-  fallback if Phase 12 hits a wall.
+- **9b — RESOLVED at Phase 12.** pgvector ships no official Windows binary, so it
+  must be built once with MSVC. This machine now has Visual Studio Community 2026,
+  so pgvector 0.8.3 was built (`nmake /F Makefile.win`) against portable PostgreSQL
+  16.9 and proven end-to-end (see Phase 12). The SQLite + `sqlite-vec` fallback is
+  no longer needed.
 
 ## Phase 10 — App-data + config foundation ✅ done
 
@@ -70,7 +67,7 @@ is built until these hold.
 - **Done when:** ingest + retrieve behave identically and `evaluate.py` still
   passes against the Phase-7 thresholds.
 
-## Phase 12 — Bundled Postgres lifecycle
+## Phase 12 — Bundled Postgres lifecycle ✅ done
 
 - A process manager that init/start/stops the portable Postgres on a private
   loopback port + app-data data dir; a single-instance guard; auto-run of the
@@ -79,6 +76,9 @@ is built until these hold.
 - **Done when:** launching the app boots its own Postgres with no Docker, and a
   hard-kill + relaunch recovers cleanly. The app-data cluster is treated as
   precious user data (never `initdb` over an existing one).
+- **Outcome:** `pgserver.py` (lifecycle) + pgvector 0.8.3 built with MSVC against
+  portable PostgreSQL 16.9. `app.py` boots it when `CITEFINDER_PG=bundled` (dev
+  still defaults to Docker). Verified end-to-end incl. crash recovery (DEVLOG T34).
 
 ## Phase 13 — Runtime LLM settings + Settings UI ✅ done
 

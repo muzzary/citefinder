@@ -30,6 +30,14 @@ from pydantic import BaseModel
 
 import local_llm
 
+# Phase 12: in BUNDLED mode (the packaged desktop app) boot the app-owned portable
+# Postgres BEFORE importing anything that opens db.CONN — ensure_ready() starts the
+# cluster, creates the DB + pgvector extension, migrates, and points CITEFINDER_DB
+# at it. Dev defaults to Docker; set CITEFINDER_PG=bundled to use the portable one.
+if os.environ.get("CITEFINDER_PG", "").lower() == "bundled":
+    import pgserver
+    pgserver.ensure_ready()
+
 import chats
 from add_source import ingest_pdf
 from query import answer, is_refusal, test_connection

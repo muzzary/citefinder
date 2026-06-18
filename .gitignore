@@ -12,3 +12,8 @@ __pycache__/
 # OS
 Thumbs.db
 .DS_Store
+
+# Bundled/portable binaries — downloaded or built, never committed (Phase 12/16):
+# portable Postgres, the compiled pgvector, and download archives.
+vendor/
+*.zip
