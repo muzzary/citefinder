@@ -1,24 +1,12 @@
-import os
 import psycopg
 
-# Load a local .env (if present) before anything reads os.environ. db.py is the
-# universal import — every module pulls connect() from here — so loading here
-# guarantees CITEFINDER_* vars (DB + the LLM endpoint in query.py) are populated
-# before they're read. A missing python-dotenv or .env is a no-op: real shell
-# env vars still work, so nothing hard-depends on the file.
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ModuleNotFoundError:
-    pass
+from settings import db_conn_string
 
-# Single source of truth for the database connection.
-# Override via the CITEFINDER_DB env var (e.g. to point at a hosted Postgres
-# when swapping local -> hosted). Falls back to the local Docker dev instance.
-CONN = os.environ.get(
-    "CITEFINDER_DB",
-    "host=localhost dbname=citefinder user=postgres password=devpass",
-)
+# Single source of truth for the database connection. settings.db_conn_string()
+# resolves it with precedence env (CITEFINDER_DB / .env) > config.json > local
+# Docker default, and also loads .env on import — so every module that pulls
+# connect() from here gets the resolved config without touching os.environ.
+CONN = db_conn_string()
 
 
 def connect(register_vec=False):

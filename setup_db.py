@@ -54,6 +54,13 @@ def setup():
             "ON chunks USING GIN (text_tsv);"
         )
 
+        # Index the FK column chunks.source_id (Postgres does NOT auto-index FKs).
+        # Speeds the chunks->sources join, the page-intent MAX(page) subquery, and
+        # ON DELETE CASCADE when a source/chat is removed.
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS chunks_source_id_idx ON chunks(source_id);"
+        )
+
         # chats: a chat OWNS the corpus added to it (see ADR 0005). Sources are
         # scoped to a chat via chat_id, so a question searches only that chat's
         # folder/files — not everything the user ever uploaded.

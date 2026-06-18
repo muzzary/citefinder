@@ -9,33 +9,40 @@ it just exposes what already exists as JSON the browser SPA (in web/) can call:
     ask          -> query.answer        (chat-scoped, ADR 0005)
     cite         -> sources.py          (confirm_source / cite_source)
 
-Single-user by design for v1: user_id is fixed to DEFAULT_USER. Going
-multi-user is purely an auth layer (derive user_id from a session) — the data
-model already partitions by user_id, so nothing here changes. See the DEVLOG.
+Single-user by design: CiteFinder ships as a personal desktop app, not a hosted
+service (see ADR 0006). user_id is a frozen constant (DEFAULT_USER); scoping is
+done per-chat via chat_id (ADR 0005), so user_id no longer partitions anything —
+it is kept only because the evaluation harness still uses it.
 
 Run:  python app.py   (then open http://localhost:8000)
 The ingest/ask endpoints are sync `def` on purpose: they do slow, blocking work
 (local embeddings, the Ollama call), so FastAPI runs them in a threadpool and
 the event loop stays responsive.
 """
+import json
 import os
 import shutil
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+import local_llm
+
 import chats
 from add_source import ingest_pdf
-from query import answer, is_refusal
+from query import answer, is_refusal, test_connection
 from sources import get_source, confirm_source, cite_source, list_sources_for_chat
 from citations import format_locator
+from appdata import uploads_dir
+from settings import llm_public, save_llm, is_llm_configured
 
-DEFAULT_USER = "user_1"               # single-user v1 (see module docstring)
+DEFAULT_USER = "user_1"               # single-user, frozen constant (ADR 0006)
 WEB_DIR = os.path.join(os.path.dirname(__file__), "web")
-UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "data", "uploads")
-os.makedirs(UPLOAD_DIR, exist_ok=True)
+# Uploads live under the per-user app-data dir (ADR 0006/0007), never inside the
+# install directory. uploads_dir() resolves + creates <app-data>/uploads.
+UPLOAD_DIR = str(uploads_dir())
 
 app = FastAPI(title="CiteFinder")
 
@@ -62,6 +69,24 @@ class Confirm(BaseModel):
 class Cite(BaseModel):
     page: int
     style: str = "APA"
+
+
+class LlmSettings(BaseModel):
+    mode: str                       # 'local' or 'cloud'
+    base_url: str
+    model: str
+    api_key: str | None = None      # only sent for cloud; omitted keeps the stored one
+    provider: str | None = None     # preset id ('groq', 'openai', 'ollama', 'custom')
+
+
+class TestConn(BaseModel):
+    base_url: str | None = None
+    model: str | None = None
+    api_key: str | None = None
+
+
+class PullModel(BaseModel):
+    model: str
 
 
 # --- upload helper -----------------------------------------------------------
@@ -169,7 +194,7 @@ def api_upload(chat_id: int, files: list[UploadFile] = File(...)):
     """
     Non-blocking ingest of one or more PDFs into this chat (ADR 0003). The
     browser sends a single file or a whole folder's files (webkitdirectory);
-    we save each PDF under data/uploads/<chat_id>/ and ingest it as an
+    we save each PDF under <app-data>/uploads/<chat_id>/ and ingest it as an
     unconfirmed Work — a Locator now, citable later. Non-PDF files and files
     that yield no text are reported as skipped, never fatal to the batch.
     """
@@ -220,6 +245,13 @@ def api_ask(chat_id: int, body: Ask):
     if not question:
         raise HTTPException(status_code=400, detail="Empty question.")
 
+    # Gate only the ASK action on LLM config (ADR 0007): ingest needs no LLM, so
+    # the user reaches this point having added material but maybe not yet chosen
+    # an LLM. Signal the UI to open the "choose how to answer" step instead of
+    # failing against an unconfigured default. Nothing is persisted.
+    if not is_llm_configured():
+        return {"needs_setup": True, "answer": None, "refused": False, "attribution": []}
+
     # Run the pipeline BEFORE persisting anything: if the local model is down
     # (e.g. Ollama out of memory) we surface a clean error and leave no orphaned
     # user turn in the history for the student to retry against.
@@ -246,7 +278,8 @@ def api_ask(chat_id: int, body: Ask):
         if chat and not chat["title"]:
             chats.rename_chat(chat_id, question[:60])
 
-    return {"answer": ans, "refused": refused, "attribution": attribution}
+    return {"answer": ans, "refused": refused, "attribution": attribution,
+            "needs_setup": False}
 
 
 # --- cite --------------------------------------------------------------------
@@ -276,6 +309,50 @@ def api_cite(source_id: int, body: Cite):
         # Unconfirmed (or notes) — the UI should show the confirm step.
         raise HTTPException(status_code=409, detail=str(e))
     return {"citation": citation, "style": body.style.upper(), "page": body.page}
+
+
+# --- settings (LLM choice) ---------------------------------------------------
+@app.get("/api/settings")
+def api_get_settings():
+    """The current LLM settings for the Settings panel (never the raw key)."""
+    return llm_public()
+
+
+@app.put("/api/settings")
+def api_put_settings(body: LlmSettings):
+    """Persist the user's LLM choice to config.json. Takes effect on the next
+    question with no restart (query._llm() reads live settings per call)."""
+    if body.mode not in ("local", "cloud"):
+        raise HTTPException(status_code=400, detail="mode must be 'local' or 'cloud'.")
+    save_llm(mode=body.mode, base_url=body.base_url, model=body.model,
+             api_key=body.api_key, provider=body.provider)
+    return llm_public()
+
+
+@app.post("/api/settings/test")
+def api_test_settings(body: TestConn):
+    """One cheap LLM call to verify an endpoint (Test-connection button). Tests
+    the supplied values, or the saved settings when fields are omitted."""
+    ok, detail = test_connection(base_url=body.base_url, api_key=body.api_key,
+                                 model=body.model)
+    return {"ok": ok, "detail": detail}
+
+
+# --- local LLM provisioning (Ollama) -----------------------------------------
+@app.get("/api/ollama/status")
+def api_ollama_status():
+    """Detect Ollama (installed/running), list pulled models + the catalog."""
+    return local_llm.status()
+
+
+@app.post("/api/ollama/pull")
+def api_ollama_pull(body: PullModel):
+    """Pull a model, streaming Ollama's progress as newline-delimited JSON so the
+    Settings UI can show a live download bar."""
+    def gen():
+        for evt in local_llm.pull(body.model):
+            yield json.dumps(evt) + "\n"
+    return StreamingResponse(gen(), media_type="application/x-ndjson")
 
 
 # --- static SPA --------------------------------------------------------------

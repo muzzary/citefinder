@@ -1,25 +1,64 @@
-import os
+import re
 
-from sentence_transformers import SentenceTransformer
 from openai import OpenAI
 from db import connect
+from settings import llm_config
+from embedder import embed
+from sources import list_sources_for_chat
 
 # same embedding model as ingestion — MUST match, or vectors won't compare.
-# Embeddings are ALWAYS local (sentence-transformers, CPU) — they never use the
+# Embeddings are ALWAYS local (ONNX all-MiniLM-L6-v2, CPU) — they never use the
 # hosted LLM, so ingestion costs zero LLM tokens regardless of the config below.
-embed_model = SentenceTransformer("all-MiniLM-L6-v2")
 
-# The LLM boundary: local-by-default, hosted opt-in (ADR 0002). Defaults to a
-# local Ollama (Phi-4 Mini) over its OpenAI-compatible endpoint. To run on a
-# hosted OpenAI-compatible provider (e.g. Groq) without code changes, set:
+# The LLM boundary: local-by-default, hosted opt-in (ADR 0002). The endpoint is
+# resolved by settings.llm_config() with precedence env (CITEFINDER_LLM_*/.env) >
+# config.json > local Ollama default — one config story for dev and the packaged
+# app. To run on a hosted OpenAI-compatible provider (e.g. Groq) set:
 #   CITEFINDER_LLM_BASE_URL=https://api.groq.com/openai/v1
 #   CITEFINDER_LLM_KEY=<your key>
 #   CITEFINDER_LLM_MODEL=llama-3.3-70b-versatile   (or llama-3.1-8b-instant, ...)
 # Only querying uses the LLM (expansion + the grounded answer); ingestion does not.
-LLM_BASE_URL = os.environ.get("CITEFINDER_LLM_BASE_URL", "http://localhost:11434/v1")
-LLM_API_KEY = os.environ.get("CITEFINDER_LLM_KEY", "ollama")
-LLM_MODEL = os.environ.get("CITEFINDER_LLM_MODEL", "phi4-mini")
-llm = OpenAI(base_url=LLM_BASE_URL, api_key=LLM_API_KEY)
+
+
+def _llm():
+    """
+    Build the OpenAI-compatible client + model name from LIVE settings on every
+    call (Phase 13). This is what lets the Settings UI switch Local<->Cloud and
+    have the very next question use it, with no process restart — the client is
+    cheap to construct (it only holds the base_url + key). settings.llm_config()
+    still applies env > config.json > default, so dev (.env) is unchanged.
+    """
+    cfg = llm_config()
+    client = OpenAI(base_url=cfg["base_url"], api_key=cfg["api_key"])
+    return client, cfg["model"]
+
+
+def test_connection(base_url=None, api_key=None, model=None, timeout=90):
+    """
+    One cheap LLM call to verify an endpoint works — backs the Settings
+    'Test connection' button so a bad key or an un-pulled local model is caught
+    at config time, not on the student's first question. Any omitted argument
+    falls back to live settings. Returns (ok: bool, detail: str).
+
+    The timeout is generous (90s) because a LOCAL model cold-loads into memory on
+    its first request, which can take far longer than a warm cloud call — a short
+    timeout would falsely report a working-but-slow local model as broken.
+    """
+    cfg = llm_config()
+    base_url = base_url or cfg["base_url"]
+    api_key = api_key or cfg["api_key"]
+    model = model or cfg["model"]
+    try:
+        client = OpenAI(base_url=base_url, api_key=api_key, timeout=timeout)
+        client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": "ping"}],
+            max_tokens=1,
+            temperature=0,
+        )
+        return True, f"Connected to {model}."
+    except Exception as e:
+        return False, str(e)
 
 # The single canonical refusal. Must match CONTEXT.md ("Covered").
 REFUSAL = "This is not covered in your material."
@@ -49,14 +88,19 @@ def is_refusal(text):
     return len(t) <= 80 or len(sentences) <= 1
 
 
-# --- Retrieval tuning, SET FROM PHASE-7 EVALUATION (evaluate.py), not guessed.
-# MAX_DISTANCE: dense coverage floor. Eval on the gold + off-topic sets showed
-#   covered questions have a best distance <= 0.621 and off-topic ones >= 0.763,
-#   so 0.69 sits cleanly between — off-topic is now refused before the LLM
-#   (the old 0.9 placeholder was too loose; it let T4's off-topic through).
-# CANDIDATE_K: per-retriever pool size before fusion. recall@5 rose from 0.819
-#   to 0.861 going 10 -> 20 and then plateaued, so 20 is the sweet spot.
-MAX_DISTANCE = 0.69
+# --- Retrieval tuning, SET FROM EVALUATION (evaluate.py --tune-floor), not guessed.
+# MAX_DISTANCE: dense coverage floor. RE-TUNED for the e5-small-v2 embedder (T32):
+#   e5's cosine distances live on a far smaller scale than MiniLM's (covered best
+#   distance 0.109-0.211, off-topic 0.178-0.249), so the old MiniLM-era 0.69 floor
+#   passed EVERYTHING and never refused. The two ranges OVERLAP (no value cleanly
+#   separates them — the large-scale benchmark T31 showed the same), so we set the
+#   floor just above covered-max to PRESERVE recall (never wrongly refuse a covered
+#   question) and rely on the LLM grounded-tutor refusal as the backstop for the
+#   off-topic that slips through the overlap. The floor is model-specific: changing
+#   the embedder requires re-running --tune-floor.
+# CANDIDATE_K: per-retriever pool size before fusion. recall plateaued past 20
+#   (Phase-7 sweep; confirmed on the large-scale bench), so 20 is the sweet spot.
+MAX_DISTANCE = 0.22
 CANDIDATE_K = 20
 
 
@@ -105,7 +149,7 @@ def retrieve(question, user_id="user_1", top_k=3, max_distance=MAX_DISTANCE,
     """
     col, val = _scope(chat_id, user_id)
     if q_vec is None:
-        q_vec = embed_model.encode(question)
+        q_vec = embed(question)
     with connect(register_vec=True) as conn, conn.cursor() as cur:
         cur.execute(
             f"""
@@ -126,9 +170,6 @@ def retrieve(question, user_id="user_1", top_k=3, max_distance=MAX_DISTANCE,
         for r in rows
         if r[10] <= max_distance
     ]
-
-
-import re
 
 
 def _or_query(question):
@@ -152,26 +193,29 @@ def _or_query(question):
 
 
 def retrieve_keyword(question, user_id="user_1", top_k=3, chat_id=None,
-                     q_vec=None, max_distance=MAX_DISTANCE):
+                     q_vec=None, max_distance=None):
     """
     Keyword retrieval: the lexical half of hybrid search. Uses Postgres
     full-text search (the generated tsvector + GIN index from setup_db.py) so
-    exact terms — names, acronyms, jargon — are matched even when the dense
-    embedding drifts. The question is converted to an OR query (see _or_query);
-    websearch_to_tsquery then parses it safely and ts_rank scores by how many
-    terms match and how often. Scoped to a chat (or user) — see _scope.
+    exact terms — names, acronyms, jargon, headings — are matched even when the
+    dense embedding drifts. The question is converted to an OR query (see
+    _or_query); websearch_to_tsquery parses it safely and ts_rank scores by how
+    many terms match and how often. Scoped to a chat (or user) — see _scope.
 
-    A keyword hit must ALSO be within the dense coverage floor (max_distance):
-    a lexical match on a single shared OR-term could otherwise surface a passage
-    that is semantically off-topic, and the fused result feeds the grounded
-    answer directly. Flooring keeps keyword's job to "exact-term passages WITHIN
-    the covered material" — it can't smuggle uncovered text past the contract.
-    q_vec lets the caller reuse the question embedding (see retrieve).
+    NO dense floor by default (max_distance=None). The whole point of the lexical
+    arm is to surface exact-term passages the dense embedding drifts away from —
+    e.g. the real "3.3 Design Description" heading chunk, whose dense distance
+    actually exceeds the coverage floor (Phase-7b). Flooring keyword by dense
+    distance dropped exactly those, defeating its purpose. Off-topic refusal is
+    still enforced separately by the dense coverage gate in answer(); within an
+    already-covered query, surfacing strong lexical matches only helps recall.
+    Pass a max_distance (and q_vec) to re-enable the floor.
     """
     col, val = _scope(chat_id, user_id)
-    if q_vec is None:
-        q_vec = embed_model.encode(question)
-    with connect(register_vec=True) as conn, conn.cursor() as cur:
+    floor = max_distance is not None
+    if floor and q_vec is None:
+        q_vec = embed(question)
+    with connect(register_vec=floor) as conn, conn.cursor() as cur:
         cur.execute(
             f"""
             SELECT c.id, c.source_id, c.chunk_text, c.page_number, s.title,
@@ -181,11 +225,12 @@ def retrieve_keyword(question, user_id="user_1", top_k=3, chat_id=None,
             JOIN sources s ON c.source_id = s.id,
                  websearch_to_tsquery('english', %s) query
             WHERE {col} = %s AND c.text_tsv @@ query
-                  AND c.embedding <=> %s <= %s
+                  {"AND c.embedding <=> %s <= %s" if floor else ""}
             ORDER BY rank DESC
             LIMIT %s;
             """,
-            (_or_query(question), val, q_vec, max_distance, top_k),
+            (_or_query(question), val, q_vec, max_distance, top_k) if floor
+            else (_or_query(question), val, top_k),
         )
         rows = cur.fetchall()
     return [_row_to_chunk(r, "rank", r[10]) for r in rows]
@@ -232,7 +277,7 @@ def rrf_fuse(ranked_lists, k=RRF_K, top_k=None):
 
 def retrieve_hybrid(question, user_id="user_1", top_k=3,
                     candidate_k=CANDIDATE_K, max_distance=MAX_DISTANCE,
-                    chat_id=None, q_vec=None):
+                    chat_id=None, q_vec=None, dense=None, keyword=None):
     """
     Hybrid retrieval: run dense (semantic) and keyword (lexical) search in
     parallel and fuse them with RRF. Dense catches paraphrase/meaning; keyword
@@ -240,13 +285,22 @@ def retrieve_hybrid(question, user_id="user_1", top_k=3,
     wider `candidate_k` pool so fusion has room to promote chunks that rank
     middling in one list but appear in both. The question is embedded once here
     and shared by both arms (q_vec).
+
+    `dense` / `keyword`: precomputed candidate lists for THIS question. answer()
+    already runs the dense arm as its coverage gate, so it passes both in here to
+    avoid re-querying — without them this recomputes both, as standalone callers
+    (evaluate.py) expect.
     """
-    if q_vec is None:
-        q_vec = embed_model.encode(question)
-    dense = retrieve(question, user_id, top_k=candidate_k,
-                     max_distance=max_distance, chat_id=chat_id, q_vec=q_vec)
-    keyword = retrieve_keyword(question, user_id, top_k=candidate_k,
-                               chat_id=chat_id, q_vec=q_vec, max_distance=max_distance)
+    if q_vec is None and dense is None:
+        q_vec = embed(question)
+    if dense is None:
+        dense = retrieve(question, user_id, top_k=candidate_k,
+                         max_distance=max_distance, chat_id=chat_id, q_vec=q_vec)
+    # Keyword arm runs UNFLOORED (see retrieve_keyword): the dense arm already
+    # contributes only covered chunks, and the coverage gate guards refusal, so
+    # the lexical arm is free to surface exact-term passages dense drifts past.
+    if keyword is None:
+        keyword = retrieve_keyword(question, user_id, top_k=candidate_k, chat_id=chat_id)
     return rrf_fuse([dense, keyword], top_k=top_k)
 
 
@@ -269,8 +323,9 @@ def expand_query(question, n=3):
         f"Question: {question}"
     )
     try:
-        resp = llm.chat.completions.create(
-            model=LLM_MODEL,
+        client, model = _llm()
+        resp = client.chat.completions.create(
+            model=model,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.3,
         )
@@ -291,7 +346,7 @@ def expand_query(question, n=3):
 
 def retrieve_multi(question, user_id="user_1", top_k=3, n_variants=3,
                    candidate_k=CANDIDATE_K, max_distance=MAX_DISTANCE,
-                   chat_id=None, q_vec=None):
+                   chat_id=None, q_vec=None, dense=None, keyword=None):
     """
     Full Phase-6 retrieval: expand the question into variants, run HYBRID
     (dense + keyword) search for each, and fuse every resulting list with one
@@ -299,15 +354,23 @@ def retrieve_multi(question, user_id="user_1", top_k=3, n_variants=3,
     and retrieve_keyword(), so each variant contributes only its own grounded
     candidates. The original question's embedding (q_vec) is reused; each
     variant is a different string and is embedded on its own.
+
+    `dense` / `keyword`: precomputed lists for the ORIGINAL question, reused
+    instead of re-querying it (answer() already has them from the hybrid pass).
     """
     queries = expand_query(question, n=n_variants)
     ranked_lists = []
     for q in queries:
-        qv = q_vec if q == question else None
-        ranked_lists.append(retrieve(q, user_id, top_k=candidate_k,
-                                     max_distance=max_distance, chat_id=chat_id, q_vec=qv))
-        ranked_lists.append(retrieve_keyword(q, user_id, top_k=candidate_k,
-                                             chat_id=chat_id, q_vec=qv, max_distance=max_distance))
+        if q == question and dense is not None:
+            ranked_lists.append(dense)
+        else:
+            qv = q_vec if q == question else None
+            ranked_lists.append(retrieve(q, user_id, top_k=candidate_k,
+                                         max_distance=max_distance, chat_id=chat_id, q_vec=qv))
+        if q == question and keyword is not None:
+            ranked_lists.append(keyword)
+        else:
+            ranked_lists.append(retrieve_keyword(q, user_id, top_k=candidate_k, chat_id=chat_id))
     return rrf_fuse(ranked_lists, top_k=top_k)
 
 
@@ -356,7 +419,133 @@ def should_expand(question, hybrid_chunks):
     return best is None or best > WEAK_MATCH_DISTANCE
 
 
-def answer(question, user_id="user_1", top_k=3, expand="auto", chat_id=None):
+# --- Structural intents -------------------------------------------------------
+# Some questions are not about the semantic CONTENT of the material but about the
+# corpus itself ("list the files") or a specific PAGE ("what's on page 2"). Dense
+# similarity can't answer these — they were refused or mis-answered — so we detect
+# them with conservative patterns and answer DETERMINISTICALLY from real data (the
+# file list / the actual page text), bypassing retrieval and the coverage gate.
+# Never hallucinated: the file names and page text are pulled straight from the DB.
+
+_CORPUS_NOUN = r"(files?|documents?|sources?|pdfs?|readings?)"
+_META_RE = re.compile(
+    rf"\bhow many {_CORPUS_NOUN}\b"
+    rf"|\b(list|show)\b.{{0,20}}\b{_CORPUS_NOUN}\b"   # list / show ... files
+    rf"|\b(what|which)\s+{_CORPUS_NOUN}\b"            # what files / which documents
+    rf"|\bnames?\s+of\b.{{0,12}}{_CORPUS_NOUN}\b"     # names of (the) files
+    rf"|\bfile names?\b",
+    re.I,
+)
+_LAST_PAGE_RE = re.compile(r"\b(last|final)\s+page\b", re.I)
+_FIRST_PAGE_RE = re.compile(r"\b(first|front|title|cover)\s+page\b|\bpage\s+(?:1|one)\b", re.I)
+_PAGE_NUM_RE = re.compile(r"\bpage\s+(\d{1,4})\b", re.I)
+
+# A page reference is treated as page-INTENT (summarise that whole page) only when
+# the question is actually ABOUT the page — "what's on page 2", "show page 3",
+# "summarise the first page", or a near-bare "page 5?". A content question that
+# merely cites a page ("explain the method on page 5") must fall through to normal
+# retrieval, which can span pages, instead of being answered from that one page.
+_PAGE_FOCUS_RE = re.compile(
+    r"\bwhat(?:'s| is| are)?\b.{0,30}\bpage\b"                  # what is on (the) page ...
+    r"|\b(show|list|summari[sz]e|describe|contents? of)\b.{0,30}\bpage\b"
+    r"|\b(first|last|final|front|title|cover)\s+page\b"         # the first/last page (unambiguous)
+    r"|^\W*page\b",                                             # "page 2", "page 2?"
+    re.I,
+)
+
+
+def _is_corpus_meta(question):
+    """True for questions enumerating the corpus ('list files', 'file names')."""
+    return bool(_META_RE.search(question))
+
+
+def _page_target(question):
+    """The page a question explicitly asks about: 'last', 'first', an int, or None.
+
+    Returns None unless the question is page-FOCUSED (see _PAGE_FOCUS_RE), so a
+    content question that only cites a page falls through to normal retrieval."""
+    if not _PAGE_FOCUS_RE.search(question):
+        return None
+    if _LAST_PAGE_RE.search(question):
+        return "last"
+    if _FIRST_PAGE_RE.search(question):
+        return "first"
+    m = _PAGE_NUM_RE.search(question)
+    return int(m.group(1)) if m else None
+
+
+def _answer_meta(chat_id):
+    """Answer a corpus-meta question from the chat's real source list (no LLM)."""
+    srcs = list_sources_for_chat(chat_id)
+    if not srcs:
+        return "No files have been added to this chat yet.", []
+    n = len(srcs)
+    lines = [
+        f"{i}. {s['filename']}" + (f" ({s['n_chunks']} sections)" if s["n_chunks"] else "")
+        for i, s in enumerate(srcs, 1)
+    ]
+    body = f"This chat contains {n} file{'s' if n != 1 else ''}:\n" + "\n".join(lines)
+    return body, []
+
+
+def _fetch_page(chat_id, user_id, target):
+    """Chunks for an explicitly requested page, scoped to the chat (or user).
+    'first' -> page 1; 'last' -> each source's max page; an int -> that page."""
+    col, val = _scope(chat_id, user_id)
+    cols = ("c.id, c.source_id, c.chunk_text, c.page_number, s.title, s.author, "
+            "s.year, s.filename, s.kind, s.confirmed")
+    with connect() as conn, conn.cursor() as cur:
+        if target == "last":
+            cur.execute(
+                f"SELECT {cols} FROM chunks c JOIN sources s ON c.source_id = s.id "
+                f"WHERE {col} = %s AND c.page_number = "
+                f"(SELECT MAX(c2.page_number) FROM chunks c2 WHERE c2.source_id = s.id) "
+                f"ORDER BY s.id, c.id;",
+                (val,),
+            )
+        else:
+            page = 1 if target == "first" else int(target)
+            cur.execute(
+                f"SELECT {cols} FROM chunks c JOIN sources s ON c.source_id = s.id "
+                f"WHERE {col} = %s AND c.page_number = %s ORDER BY s.id, c.id;",
+                (val, page),
+            )
+        rows = cur.fetchall()
+    return [_row_to_chunk(r, "page_hit", 0.0) for r in rows]
+
+
+def _answer_page(question, chat_id, user_id, target):
+    """Summarise what is on an explicitly requested page, from that page's actual
+    text (bypasses the semantic gate — the user named the page)."""
+    chunks = _fetch_page(chat_id, user_id, target)
+    if not chunks:
+        where = ("the first page" if target == "first"
+                 else "the last page" if target == "last" else f"page {target}")
+        return f"There is no extractable text on {where} in your material.", []
+    context = "\n\n".join(
+        f"[{c['filename']}, page {c['page']}]\n{c['text']}" for c in chunks
+    )
+    system_prompt = (
+        "You are a study assistant. The student asked what is on a specific page "
+        "of their own material. Using ONLY the provided page text, describe and "
+        "explain what is on that page in clear, simple terms. Never add facts from "
+        "outside the text. Do not list file names or page numbers yourself — that "
+        "is shown separately."
+    )
+    user_prompt = f"PAGE TEXT:\n{context}\n\nQUESTION: {question}"
+    client, model = _llm()
+    response = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        temperature=0.0,
+    )
+    return response.choices[0].message.content, chunks
+
+
+def answer(question, user_id="user_1", top_k=5, expand="auto", chat_id=None):
     """
     Grounded-tutor RAG with an adaptive retriever, scoped to a chat's corpus
     when chat_id is given (else the user's whole library — see _scope).
@@ -370,35 +559,52 @@ def answer(question, user_id="user_1", top_k=3, expand="auto", chat_id=None):
 
     If nothing is covered, refuse BEFORE the answer LLM call.
     """
+    # Structural intents first (chat-scoped): a question about the corpus itself
+    # ("list the files") is answered from the real source list, no retrieval.
+    if chat_id is not None and _is_corpus_meta(question):
+        return _answer_meta(chat_id)
+
     # Structural refusal, layer one: nothing ingested in scope is refused before
     # ANY LLM call — so we never spin up the model for an empty chat/library.
     if not _has_material(user_id, chat_id=chat_id):
         return "No material found. Have you ingested any documents?", []
 
-    # Embed the question ONCE here and reuse it for the coverage gate and both
-    # hybrid arms (and the original-question pass in multi-query). The encode is
-    # the dominant CPU cost on the ask path; recomputing it per retriever was
-    # pure waste.
-    q_vec = embed_model.encode(question)
+    # Page-scoped intent ("what's on page 2 / the first page"): answer from that
+    # page's actual text, bypassing the semantic gate (the user named the page).
+    page_target = _page_target(question)
+    if chat_id is not None and page_target is not None:
+        return _answer_page(question, chat_id, user_id, page_target)
 
-    # Coverage gate (structural refusal, layer two): is anything semantically
-    # close enough? Coverage is decided by DENSE distance against the tuned
-    # MAX_DISTANCE floor — NOT by keyword overlap, which (with OR semantics)
-    # matches almost any question that shares a common word and so can't tell
-    # "covered" from "off-topic". Phase-7 eval set this floor to separate the
-    # two cleanly, so off-topic refuses here, before any answer/expansion LLM.
-    if not retrieve(question, user_id, top_k=1, chat_id=chat_id, q_vec=q_vec):
+    # Embed the question ONCE here and reuse it everywhere. The encode is the
+    # dominant CPU cost on the ask path; recomputing it per retriever was waste.
+    q_vec = embed(question)
+
+    # Coverage gate (structural refusal, layer two) AND the hybrid dense arm in
+    # ONE scan: pull the dense candidate pool once. Coverage is decided by DENSE
+    # distance against the tuned MAX_DISTANCE floor — NOT by keyword overlap,
+    # which (with OR semantics) matches almost any question sharing a common word
+    # and so can't tell "covered" from "off-topic". An empty pool means nothing
+    # is within the floor, so we refuse before any answer/expansion LLM. (This
+    # pool is exactly what retrieve_hybrid's dense arm needs, so we don't rescan.)
+    dense = retrieve(question, user_id, top_k=CANDIDATE_K, chat_id=chat_id, q_vec=q_vec)
+    if not dense:
         return REFUSAL, []
 
-    # Covered: rank with the cheap hybrid path (no extra LLM call). Keyword
-    # chunks may be semantically farther, but coverage is already established,
-    # so they only help surface exact-term passages within the covered material.
-    chunks = retrieve_hybrid(question, user_id, top_k=top_k, chat_id=chat_id, q_vec=q_vec)
+    # Covered: rank with the cheap hybrid path (no extra LLM call), reusing the
+    # dense pool from the gate so the only new query is the keyword arm. Keyword
+    # chunks may be semantically farther, but coverage is already established, so
+    # they only help surface exact-term passages within the covered material.
+    keyword = retrieve_keyword(question, user_id, top_k=CANDIDATE_K, chat_id=chat_id)
+    chunks = retrieve_hybrid(question, user_id, top_k=top_k, chat_id=chat_id,
+                             q_vec=q_vec, dense=dense, keyword=keyword)
 
-    # Escalate to multi-query only when the hybrid result looks weak (this is
-    # the only LLM cost retrieval can add, so we gate it deliberately).
+    # Escalate to multi-query only when the hybrid result looks weak (this is the
+    # only LLM cost retrieval can add, so we gate it deliberately). Reuse the
+    # already-fetched dense/keyword lists for the original question — only the
+    # expansion variants need fresh queries.
     if expand is True or (expand == "auto" and should_expand(question, chunks)):
-        chunks = retrieve_multi(question, user_id, top_k=top_k, chat_id=chat_id, q_vec=q_vec)
+        chunks = retrieve_multi(question, user_id, top_k=top_k, chat_id=chat_id,
+                                q_vec=q_vec, dense=dense, keyword=keyword)
 
     if not chunks:
         return REFUSAL, []
@@ -423,8 +629,9 @@ def answer(question, user_id="user_1", top_k=3, expand="auto", chat_id=None):
 
     user_prompt = f"SOURCES:\n{context}\n\nQUESTION: {question}"
 
-    response = llm.chat.completions.create(
-        model=LLM_MODEL,
+    client, model = _llm()
+    response = client.chat.completions.create(
+        model=model,
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},

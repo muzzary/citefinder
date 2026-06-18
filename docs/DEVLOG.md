@@ -2,7 +2,461 @@
 
 A running record of work done, decisions made, tests run, and bugs fixed.
 Newest entries at the top. For the *why* behind decisions see [CONTEXT.md](CONTEXT.md)
-and the ADRs (`0001`–`0004`).
+and the ADRs (`0001`–`0007`).
+
+---
+
+## Embedder upgrade: all-MiniLM-L6-v2 → e5-small-v2
+
+### 1. What was done
+
+Acting on the T31 finding that the embedding model — not chunking — is the lever
+for dense retrieval quality, A/B'd four 384-dim ONNX embedders over the
+ground-truthed benchmark (`bench_embedders.py`, offline + in-memory, no DB/prod
+change): current MiniLM vs bge-small-en-v1.5, gte-small, e5-small-v2. All loaded
+through the same torch-free path (tokenizers + onnxruntime + numpy), with each
+model's correct pooling (bge=CLS, others=mean) and training prefixes.
+
+**e5-small-v2 won decisively** (dense, 7,204-passage corpus):
+
+| model | lexical hit@5 | lexical MRR | semantic hit@5 | semantic MRR |
+|---|---|---|---|---|
+| MiniLM (old) | 0.750 | 0.558 | 0.094 | 0.056 |
+| bge-small | 0.883 | 0.797 | 0.072 | 0.042 |
+| gte-small | 0.906 | 0.798 | 0.106 | 0.064 |
+| **e5-small-v2** | **0.972** | **0.892** | **0.156** | **0.094** |
+
+Swapped it into production behind the existing `embed()` interface:
+- `embedder.REPO` → `Xenova/e5-small-v2` (ONNX mirror; same onnx/model.onnx +
+  tokenizer.json files, still 384-dim → drop-in for the vector(384) column).
+- **Asymmetric prefixes**: e5 needs `query: ` on questions and `passage: ` on
+  documents. `embed(texts, kind="query"|"passage")` now prepends the right one;
+  `query.py` (questions) uses the default `query`, `embed_store` (chunks) passes
+  `passage`. Omitting prefixes materially hurts e5, so this is required.
+- **Re-tuned the coverage floor**: e5 distances are on a far smaller scale, so the
+  MiniLM-era `MAX_DISTANCE=0.69` passed everything (never refused). `--tune-floor`
+  on the e5-indexed eval corpus gave covered 0.109–0.211 vs off-topic 0.178–0.249
+  (overlapping), so set `MAX_DISTANCE=0.22` — just above covered-max to preserve
+  recall, with the LLM grounded-tutor refusal as the backstop for the overlap.
+
+**Breaking change — re-indexing required.** e5 query-vectors can't be compared to
+MiniLM passage-vectors, so every stored corpus must be re-embedded. Fresh desktop
+installs are unaffected; existing dev/user corpora (the eval corpus, the benchmark
+corpora, any real chats) must be re-ingested. No new dependencies (same ONNX
+stack). Ingest is ~2× slower (e5 is 12-layer vs MiniLM's 6) — acceptable given
+ingest is embed-bound and the quality jump is large; a quantized ONNX can recover
+most of the speed later.
+
+### 2. Tests
+
+**T32 — embedder A/B + production swap (real embedder, real LLM)**
+- Offline A/B table above (`bench_embedders.py`, in-memory dense ranking against
+  ground truth; passage embeddings cached to app-data).
+- **Real Phase-7 eval, eval corpus re-ingested with e5** (`evaluate.py
+  --tune-floor`): dense hit@1 0.667→**0.750**, recall@5 0.819→**0.931**, MRR
+  0.792→**0.875**; hybrid hit@1 0.500→**0.917**, MRR 0.715→**0.944** vs the MiniLM
+  baseline — large gains on real data, no regression.
+- **End-to-end `answer()` (real LLM)**: covered eval question → grounded answer (5
+  chunks, not a refusal); all 6 off-topic → refused (3 by the 0.22 floor, 3 by the
+  LLM backstop on the overlap) — the two-layer refusal contract holds under e5.
+- **Large-scale production-path re-validation** (7,204-chunk bench re-ingested with
+  e5, queried through `query.py`): reproduces the offline A/B exactly — dense
+  lexical hit@5 0.972 / MRR 0.892, semantic hit@5 0.156 — confirming the
+  query/passage prefix wiring is correct. Bonus: **hybrid lexical is now perfect
+  (hit@1/MRR 1.000)** — e5's stronger dense arm means RRF no longer demotes
+  keyword's exact hits (the T31 fusion-dilution finding resolves itself). The
+  coverage floor still OVERLAPS at scale (off-topic absent-entity negatives are
+  phrased identically to covered Qs — no distance can separate them; the LLM
+  refusal backstop remains required, as designed). Ingest with e5: ~20 chunks/sec
+  vs ~33 for MiniLM (the expected ~1.6× cost of a 12- vs 6-layer model).
+- `py_compile` on `embedder.py`, `embed_store.py`, `query.py` → OK.
+
+---
+
+## Large-scale retrieval benchmark (synthetic, ground-truthed)
+
+### 1. What was done
+
+Built a synthetic large-scale benchmark to stress retrieval far beyond the
+78-chunk Phase-7 set, with exact ground truth. `bench_corpus.py` generates topical
+filler (hard, same-subject distractors) and plants unique coined "needle" entities
+in single fact sentences at known locations; a chunk is relevant iff it contains
+that entity. Each needle yields a **lexical** question (contains the entity → tests
+keyword) and a **semantic** paraphrase (no entity → tests dense meaning-match),
+plus off-topic negatives (absent entities + real trivia). `bench_eval.py` reports
+hit@k / MRR by question type, per-query latency, coverage-floor separation, a
+candidate_k sweep, and an optional LLM multi-query comparison. Corpus is isolated
+under `bench_user*` (`python bench_corpus.py --clean`).
+
+Ran two corpora over the SAME questions: default chunking (1200/300, 120 docs →
+2,409 chunks) and a small-chunk variant (350/80 → 7,204 chunks).
+
+### 2. Findings (data-backed)
+
+- **Semantic (paraphrase) retrieval is the real weakness.** All methods get
+  hit@5 ≈ 0.07–0.11 on paraphrased questions among same-topic distractors. Cause
+  isolated to the **embedding model** (384-d MiniLM), not chunking: shrinking
+  chunks 1200→350 barely moved it (0.072→0.094 dense, 0.078→0.111 hybrid).
+- **Chunk granularity strongly helps lexical/dense, though.** dense lexical
+  hit@5 0.483→0.750, MRR 0.326→0.558; hybrid lexical MRR 0.773→0.933 going
+  1200→350. (Big chunks dilute a specific fact's signal under filler.)
+- **RRF hybrid demotes perfect keyword hits.** keyword is perfect on exact-term
+  questions (hit@1/MRR 1.000); hybrid drops it (MRR 0.77 at 1200, 0.93 at 350) by
+  blending in dense's weaker ranking. Fusion should weight/boost exact matches.
+- **The coverage floor does NOT generalize.** `MAX_DISTANCE=0.69` (tuned on one
+  small PDF) wrongly accepts 57% (1200) / 75% (350) of off-topic at scale; covered
+  vs off-topic distances now OVERLAP. An absolute distance gate is insufficient at
+  scale — needs relative-gap / per-corpus calibration / rerank score.
+- **Ingest is embedding-bound, NOT insert-bound** (corrected an initial wrong
+  read). Re-ingesting the same 2,409 chunks row-by-row (232 s) vs batched
+  `executemany` (244 s) showed no gain; the two corpora took near-equal time for
+  near-equal TOTAL tokens (≈617k vs ≈576k) despite 3× the row count. Cost ≈ total
+  tokens / CPU ONNX throughput (~2,500 tok/s here). Kept `executemany` (good
+  practice, fewer round trips) but the real ingest lever is the embedder.
+- **Dense latency grows with corpus size** (seq scan, no ANN index): ~90 ms @
+  2.4k → ~130 ms @ 7.2k chunks. Fine now; an HNSW index is the lever for large
+  libraries (and would re-introduce approximate recall — re-tune the floor then).
+- **Multi-query expansion stays a weak lever at scale** (real LLM, 40 semantic
+  Qs): hit@5 0.20→0.25 but no MRR gain and ~11× latency (170 ms → 1.9 s). Confirms
+  the Phase-7 decision to keep it conditional/off by default.
+
+### 3. Tests
+
+**T31 — synthetic benchmark (real embedder + real LLM for the multi pass)**
+- Corpora: `bench_user` 2,409 chunks (1200/300), `bench_user_small` 7,204 chunks
+  (350/80), 120 docs, 180 needles, 360 gold + 40 off-topic; deterministic (seed 7).
+- Numbers above are the harness output; `executemany` correctness confirmed by the
+  bench retrieving correctly (keyword lexical hit@1 1.000 on both corpora).
+- No production retrieval code changed in this round (only `store_chunks` insert
+  shape), so the Phase-7 eval is unaffected.
+
+### 4. Recommended improvements (prioritised, not yet built)
+
+1. **Stronger ONNX embedder** (e.g. bge-small/base-en-v1.5, e5-small, gte-small)
+   — the single highest-leverage fix for semantic recall; stays torch-free.
+2. **Cross-encoder reranker** over the fused candidate pool — lifts both lexical
+   and semantic at modest latency; also gives a better coverage signal than raw
+   distance.
+3. **Coverage gate beyond an absolute floor** — relative gap / per-corpus
+   calibration / rerank score (the 0.69 floor mis-fires at scale).
+4. **Fusion that respects exact matches** — boost/weight the keyword arm so a
+   verbatim rare-term hit isn't demoted by dense.
+5. **HNSW index** once per-corpus chunk counts grow large.
+
+---
+
+## Pipeline review fixes: efficiency + accuracy + hygiene
+
+### 1. What was done
+
+A focused review of the chunk → embed → retrieve pipeline (correctness,
+efficiency, cleanliness) surfaced redundant work on the hot path and a few
+accuracy/cleanup edges. Fixed the actionable ones; two were deliberately left as
+documented trade-offs (below).
+
+**Efficiency**
+- **One dense scan per covered query, not two.** `answer()` used to run a
+  `retrieve(top_k=1)` coverage gate *and then* a second dense scan inside
+  `retrieve_hybrid`. The gate result is a strict subset of the hybrid dense pool,
+  so the gate now pulls the full `CANDIDATE_K` pool once and reuses it (empty pool
+  ⇒ refuse). `retrieve_hybrid` / `retrieve_multi` gained optional `dense`/`keyword`
+  params so the precomputed lists pass straight through (standalone callers like
+  `evaluate.py` are unaffected — they still compute their own).
+- **No recompute on expansion.** When the router escalates to multi-query, the
+  original question's dense+keyword lists are reused instead of re-queried; only
+  the expansion variants hit the DB.
+- **Batched embedding.** `embedder.embed` now embeds in `BATCH_SIZE`(=64) groups
+  instead of one `encode_batch` over the whole document/folder, so ingesting a big
+  folder no longer builds one giant `(N, seq, 384)` tensor. Verified bit-identical
+  to the single-batch result (max abs diff `0.0`).
+- **Indexed `chunks.source_id`** (Postgres doesn't auto-index FKs): speeds the
+  chunks→sources join, the page-intent `MAX(page)` subquery, and `ON DELETE CASCADE`.
+
+**Accuracy**
+- **Page intent no longer hijacks content questions.** A page reference now routes
+  to the whole-page summariser only when the question is *about* the page
+  (`_PAGE_FOCUS_RE`); "explain the method on page 5" falls through to normal
+  retrieval (which can span pages) instead of being answered from page 5 alone.
+- **Per-line TOC filter.** Dotted table-of-contents lines are dropped per line
+  before packing (`_is_toc_line`), matching the original intent — a TOC line can't
+  survive by being diluted in a prose chunk, and a real heading isn't dropped for
+  sharing a chunk with TOC junk.
+
+**Hygiene**
+- Moved `import re` and `from sources import ...` to the top of `query.py` (they
+  sat mid-file; `is_refusal` used `re` above its old import — worked only at
+  runtime). Dropped the `embed_store.embed_texts` one-line pass-through (callers
+  use `embed` directly).
+
+**Deliberately NOT changed (trade-offs, not omissions):**
+- *No ANN index on `chunks.embedding`.* Exact cosine is the most accurate option
+  and per-chat corpora are small; an HNSW index trades recall for speed and would
+  need re-tuning the Phase-7 thresholds. Revisit only when per-chat corpora grow.
+- *Chunk size stays 1200 chars* even though it can exceed the model's 256-token
+  limit (the tail of a few chunks isn't embedded). Sizing by token count regressed
+  recall in a prior experiment (1400/200) and the current size is eval-validated.
+
+### 2. Tests
+
+**T30 — pipeline review fixes (real LLM, eval harness, real PDF)**
+- Precondition: eval corpus re-ingested from scratch (78 chunks) so the chunker
+  (A3) + batched embedder are exercised on a fresh ingest.
+- Routing unit check (pure, no DB): `_page_target` — "what is on page 2"→2,
+  "first page"→first, "the last page"→last, "summarise page 3"→3, "page 2?"→2,
+  **"explain the method described on page 5"→None**, "how is page ranking
+  computed"→None; `_is_corpus_meta` — file-list phrasings True, "explain
+  backpropagation" False. All pass.
+- Embedding parity: single→`(384,)` norm 1.0; list→`(N,384)`; one-batch vs
+  3-batch (BATCH_SIZE=2) and batched vs per-item both max abs diff `0.0`.
+- Eval harness (re-ingested): hybrid **hit@5 1.000, recall@5 0.861, dense
+  recall@5 0.819 — identical to the Phase-7 baseline, no regression**; floor
+  analysis still separable (covered ≤0.620 < off-topic ≥0.772), suggested floor
+  0.696 ≈ the tuned `MAX_DISTANCE=0.69`.
+- End-to-end `answer()` (real LLM via the configured endpoint): covered eval
+  question → grounded answer, 5 chunks, not a refusal; off-topic ("sourdough
+  recipe") → canonical refusal, 0 chunks, refused before any LLM call (new
+  dense-pool gate intact); "list all the files" (chat 24) → real file list, 0
+  chunks, no LLM; "what is on page 1" (chat 24) → title-page summary, 1 chunk.
+- `py_compile` on all changed files → OK.
+- Postcondition: retrieval results unchanged vs the Phase-7 baseline; the ask path
+  does one fewer dense scan per covered query (and avoids the original-question
+  recompute on expansion); ingest embeds in bounded-memory batches.
+
+---
+
+## Retrieval quality + structural (meta/page) questions
+
+### 1. What was done
+
+User testing on a real thesis PDF surfaced three failure types. Diagnosed against
+the live data (the content was indexed — it was retrieval/handling), then fixed.
+
+**Tier 1 — structural intents (deterministic, no retrieval, answered from real
+data so nothing is hallucinated):**
+- **Corpus-meta** ("list the files", "what are the file names", "how many
+  documents") → answered from `list_sources_for_chat` (real filenames + count).
+  Conservative regex (`_is_corpus_meta`); content questions don't trigger it.
+- **Page-scoped** ("what's on page 2 / the first page / the last page") → fetch
+  that page's actual chunks (`_fetch_page`) and summarise, bypassing the semantic
+  gate (the user named the page). Fixes the previously-refused "first page"
+  question — it now returns the title-page authors/supervisor.
+- Both wired into `answer()` before the RAG path; meta runs before the
+  empty-library check, page after it.
+
+**Tier 2 — retrieval recall/ranking:**
+- **Unfloored keyword arm.** `retrieve_keyword` no longer floors lexical hits by
+  dense distance (the floor was silently dropping the real "3.3 Design
+  Description" chunk, whose dense distance exceeds the coverage floor). Off-topic
+  refusal is still enforced by the separate dense coverage gate, so grounding is
+  unchanged. Effect: on the test chat, the Design Description page jumped from
+  not-in-top-5 / out-ranked-by-"Dedication" to **#1**.
+- **Line-aware chunking.** `chunk.py` now packs whole lines up to the size budget
+  (`_pack_lines`) instead of slicing at a fixed character offset, so a heading
+  stays with the text that follows it. Kept the original 1200/300 size+overlap —
+  an experiment at 1400/200 regressed dense recall (bigger chunks dilute the
+  embedding), so size/overlap were restored.
+- **answer() top_k 3 → 5.** Feeds the LLM more of a section; turned the partial
+  "the description is cut off" reply into a full, correct explanation of the
+  Design Description's five layers.
+
+### 2. Tests
+
+**T29 — retrieval quality before/after (real LLM, real PDF + eval harness)**
+- Diagnosis (chat 24): "what's on the first page" → REFUSED; "Explain Design
+  Description" → p6 "Dedication" ranked #1, real p35 section absent from top-5;
+  title-page author names beyond the 0.69 floor.
+- After Tier 1: "list all the files" / "names of the files" → the real file list;
+  "what's on the first page" → title-page authors + supervisor with a p.1 Locator.
+- After Tier 2 (chat 24 re-indexed with the new chunker): "Explain Design
+  Description" → grounded answer naming the five architecture layers; p35 now
+  retrieved. Off-topic ("capital of France") still → canonical refusal (gate
+  intact).
+- **Eval harness (re-ingested eval corpus, new chunker + unfloored keyword):**
+  hybrid **hit@5 1.000, recall@5 0.861, MRR 0.757 — identical to the Phase-7
+  baseline (no regression)**; keyword recall@5 improved 0.708 → 0.792.
+- Known/limits: multi-query expansion can still re-surface a generic chunk
+  (the "Dedication" page) high in attribution on well-phrased questions — the
+  Phase-7 finding that selective expansion needs a vaguer gold set to tune
+  (`SHORT_QUESTION_WORDS` / `WEAK_MATCH_DISTANCE`) still stands. Existing chats
+  need a re-index to get the chunker change; new uploads get it automatically.
+- `node --check web/app.js` → OK.
+
+---
+
+## Phase 14: local LLM provisioning (Ollama detect-and-guide)
+
+### 1. What was done
+
+The "Local" option is now self-provisioning (ADR 0007): the app detects Ollama,
+offers a small RAM-sized model catalog, and pulls a chosen model with a live
+progress bar — no terminal.
+
+- New `local_llm.py` (stdlib only — no new dependency): `status()` (installed /
+  running / pulled models + a curated `CATALOG` with size + RAM hints +
+  download URL) and `pull(model)` (streams Ollama's native `/api/pull` progress
+  as dicts with a computed `percent`). Talks to Ollama's API on :11434; the
+  answer path still reaches the model via the OpenAI-compatible :11434/v1
+  endpoint.
+- `app.py`: `GET /api/ollama/status` and `POST /api/ollama/pull` (a
+  `StreamingResponse` of newline-delimited JSON for the download bar).
+- `web/`: when the provider is **Local (Ollama)**, the Settings modal shows a
+  panel instead of a free-text model field — Ollama status (with install/start
+  guidance + a Re-check when it's down), a model list (catalog ∪ already-pulled)
+  with size/RAM hints, a per-model **Download** that streams progress into a bar,
+  and a radio-style pick. Cloud providers keep the base_url/model/key fields. The
+  panel keeps hidden `f-base`/`f-model` inputs so Save/Test stay uniform.
+- `query.test_connection` timeout 20s → **90s**: a local model cold-loads into
+  memory on its first request (a one-token ping measured 17.4s cold here), so a
+  short timeout falsely reported a working-but-slow local model as broken.
+
+### 2. Tests
+
+**T28 — Ollama provisioning over HTTP + real local generation**
+- `GET /api/ollama/status` → `installed:true, running:true`, sees
+  `phi4-mini:latest`, catalog ids `[gemma2:2b, llama3.2:3b, qwen2.5:3b,
+  phi4-mini]`. PASS.
+- `POST /api/ollama/pull {phi4-mini}` (already present) → streamed
+  `verifying sha256 → writing manifest → success`. PASS (stream proven).
+- Direct probe: a cold phi4-mini generation returned in **17.4s** — local IS
+  viable on this low-memory machine, just slow to cold-load (DEVLOG D8 context).
+- After the 20s→90s timeout fix: `POST /api/settings/test` against
+  `localhost:11434/v1` + `phi4-mini` → `{ok:true, "Connected to phi4-mini."}`.
+  PASS (a real local generation, no `.env` change).
+- `node --check web/app.js` → OK. `.env` left on Groq per the user's choice.
+
+---
+
+## Phase 13: runtime LLM settings + Settings UI
+
+### 1. What was done
+
+The LLM is no longer wired once at import; the user chooses it at runtime and the
+choice takes effect on the next question with no restart (ADR 0007). Two LLM
+options only — pull-local (Ollama) or bring-your-own OpenAI-compatible key — with
+no built-in/embedded key (ADR 0006/0007).
+
+- **Per-call client (`query._llm()`).** `expand_query` and `answer` now build the
+  `OpenAI` client + model from `settings.llm_config()` on each call instead of a
+  module-global. Cheap (the client just holds base_url + key), so flipping
+  Local↔Cloud in Settings is picked up by the very next question.
+- **Settings backend (`settings.py`).** `is_llm_configured()` (env override OR an
+  explicit `llm.mode` in config.json), `llm_public()` (UI shape — never the raw
+  key; carries `has_key` + `env_locked`), `save_llm()` (writes config.json; only
+  overwrites the key when a new one is supplied). `query.test_connection()` does
+  one cheap call to verify an endpoint.
+- **API (`app.py`).** `GET/PUT /api/settings`, `POST /api/settings/test`. The
+  `ask` endpoint now gates on config: if no LLM is configured it returns
+  `{needs_setup:true}` and persists nothing (ingest never gated — embeddings are
+  local; only answering needs the LLM).
+- **Settings UI (`web/`).** A gear icon on home / list / chat opens a Model
+  settings modal: provider presets (Local · Groq · OpenAI · OpenRouter · Custom)
+  that fill base_url + model, a key field (hidden for local; Groq shows a
+  free-key hint), a Test-connection button, and a Local-keeps-it-private /
+  Cloud-sends-excerpts notice (ADR 0002). New icons: gear / cpu / cloud. The
+  ask-gate opens this same modal titled "Choose how to answer" on the first
+  question and retries automatically once saved.
+
+### 2. Tests
+
+**T27 — settings + gate end-to-end over HTTP, real LLM**
+- Precondition: server launched on an isolated app-data dir with the `.env` LLM
+  vars neutralised (empty), i.e. a genuine fresh-install state.
+- Input/Output:
+  - `GET /api/settings` → `configured:false, env_locked:false` (raw key absent
+    from the payload). PASS.
+  - ask before configuring → `{needs_setup:true}`, no turn persisted. PASS.
+  - `PUT /api/settings` (cloud Groq + real key) → `configured:true, mode:cloud,
+    provider:groq, has_key:true`; key never echoed. PASS.
+  - `POST /api/settings/test` → `{ok:true}` against the real Groq endpoint. PASS.
+  - upload `sample1.pdf` (ONNX ingest, 8 chunks) → ask → `needs_setup:false,
+    refused:false`, a real grounded answer + 2 Locators — proving the per-call
+    client read config.json (env was cleared) and answered live. PASS.
+- Postcondition: test chat deleted (cascade), scratch app-data removed.
+- `node --check web/app.js` → OK.
+
+---
+
+## Desktop-app re-architecture: decisions, Phase 9 spikes, Phase 10–11
+
+### 1. What was done
+
+A request to add multi-user accounts (register/verify-email/login) was explored
+and **rejected**: email verification forces a hosted service, which breaks the
+local-first promise (the corpus would leave the machine). We pivoted the other
+way — ship CiteFinder as a **single-user desktop app** the user downloads and
+runs ([ADR 0006](0006-single-user-desktop-app.md)), with a **bundled Postgres**,
+an **ONNX embedder**, self-managed services, and a runtime choice of **local
+(Ollama)** or **bring-your-own-key cloud** LLM ([ADR 0007](0007-bundle-postgres-fetch-llm.md)).
+Full plan in [ROADMAP.md](ROADMAP.md) (Phases 9–14 in scope; native window +
+installer deferred). Corrected the now-false "multi-user is just an auth layer"
+wording in `app.py` and the README.
+
+**Phase 9 — de-risk spikes (go/no-go):**
+- **9a (ONNX embeddings) — PASS.** Proved a torch-free embedding path
+  (`tokenizers` + `onnxruntime` + numpy mean-pool/normalize, using the
+  pre-exported `onnx/model.onnx` in the `all-MiniLM-L6-v2` HF repo) reproduces
+  the sentence-transformers vectors to FP precision. Phase-11 note: use
+  `tokenizers.Tokenizer`, not `transformers.AutoTokenizer` (the latter imports
+  torch).
+- **9b (portable Postgres + pgvector on Windows) — deferred to Phase 12.** No
+  official Windows pgvector binary and no MSVC compiler on this machine; the
+  extension needs a one-time MSVC build (CI / build machine) — known effort, not
+  unknown feasibility. Phases 10–11 don't need bundled Postgres (dev keeps
+  Docker), so the bundling proof waits for Phase 12. SQLite + `sqlite-vec` stays
+  the fallback.
+
+**Phase 10 — app-data + config foundation:**
+- New `appdata.py`: cross-platform per-user data dir (`%APPDATA%\CiteFinder` on
+  Windows), overridable via `CITEFINDER_HOME`; resolvers for `uploads/` and
+  `config.json`. Nothing mutable is written into the install dir (ADR 0006).
+- New `settings.py`: single config resolver with precedence **env (/.env) >
+  config.json > built-in default** for both the DB connection string and the LLM
+  endpoint. `.env` loading moved here from `db.py`.
+- Rewired `db.py` (`CONN = db_conn_string()`), `query.py` (LLM endpoint from
+  `llm_config()`; `import os` dropped — unused), and `app.py` (`UPLOAD_DIR` now
+  the app-data uploads dir). Dev behaviour is unchanged: `.env` + Docker still win.
+
+**Phase 11 — embedder torch → ONNX:**
+- New `embedder.py`: the local `all-MiniLM-L6-v2` embedding via `tokenizers` +
+  `onnxruntime` + numpy (tokenize → ONNX → mean-pool → L2-normalize), model files
+  cached under `<app-data>/models`. One `embed()` handles a single string
+  (returns `(384,)`) or a list (returns `(N, 384)`), matching the old
+  `.encode()` call shapes.
+- `embed_store.embed_texts` and `query.py`'s four `embed_model.encode(...)` sites
+  now call `embedder.embed`; `SentenceTransformer` removed from both. Runtime is
+  now torch-free.
+- `requirements.txt`: dropped `sentence-transformers`; added `onnxruntime`,
+  `tokenizers`, `huggingface_hub`, `numpy`. (torch is no longer a runtime dep; it
+  remains only as a build-time tool if we ever re-export the ONNX model.)
+
+### 2. Tests
+
+**T24 — config precedence (settings.py)**
+- Precondition: `.env` defines `CITEFINDER_LLM_*` (Groq) but no `CITEFINDER_DB`.
+- Input: resolve config with real env; then with an isolated `CITEFINDER_HOME`
+  holding a `config.json` (db + llm) and DB env cleared.
+- Output: real env → LLM = Groq (env wins), DB = Docker default (not in env/json).
+  Isolated → DB came from config.json (`dbname=fromjson`); LLM still from `.env`
+  (correct: env > config.json, and `.env` carries only the LLM vars).
+- Postcondition: precedence env > config.json > default holds for both keys. PASS.
+
+**T25 — import chain + live DB after rewire**
+- `import app` succeeds; `app.UPLOAD_DIR` = `%APPDATA%\CiteFinder\uploads`. PASS.
+- `db.connect()` → `SELECT 1` returns 1 against the Docker instance;
+  `chats.list_chats('user_1')` runs. PASS.
+
+**T26 — ONNX embedder parity + retrieval unchanged (Phase 9a / 11)**
+- Precondition: 9a proved ONNX vectors == sentence-transformers to FP precision
+  (cosine 1.000000) on a torch-free path.
+- Input: `embed()` smoke test (single + batch + empty string); full `evaluate.py`
+  run (dense / keyword / hybrid) over the 76-chunk eval corpus + 12 gold
+  questions, with query vectors now produced by ONNX.
+- Output: `embed('...')` → `(384,)` unit-norm float32; `embed([...])` →
+  `(N, 384)` all finite. evaluate.py reproduced the **exact** Phase-7 numbers —
+  hybrid hit@5 = 1.000, recall@5 = 0.861; dense recall@5 = 0.819.
+- Postcondition: retrieval quality is unchanged by the embedder swap; `import
+  embed_store, query` leaves `torch` and `sentence_transformers` absent from
+  `sys.modules`. PASS.
 
 ---
 

@@ -12,7 +12,7 @@ See [CONTEXT.md](docs/CONTEXT.md) for the project vocabulary (Source, Work, Note
 
 - Python (backend logic)
 - PostgreSQL + pgvector (vector storage), run via Docker
-- sentence-transformers `all-MiniLM-L6-v2` (local embeddings, CPU)
+- `e5-small-v2` via ONNX Runtime (local embeddings, CPU, torch-free; 384-dim, asymmetric `query:`/`passage:` prefixes). Replaced all-MiniLM-L6-v2 after a benchmark A/B (DEVLOG T31/T32).
 - Phi-4 Mini via Ollama, OpenAI-compatible endpoint (local LLM)
 - pypdf (PDF text + metadata extraction)
 
@@ -105,7 +105,9 @@ README.md, CLAUDE.md # stay at root by convention
 - Grounded tutor answers ([ADR 0004](docs/0004-grounded-tutor-only-from-material.md)); LLM boundary local-by-default ([ADR 0002](docs/0002-local-by-default-hosted-opt-in.md)).
 - Retrieval (adaptive): hybrid (dense pgvector + Postgres full-text `tsvector`/`ts_rank`) fused with RRF on every query; escalates to multi-query expansion only when the hybrid result is weak, so a well-phrased question costs one LLM call, not two.
 
-**Phase 7 — Evaluation** (built 2026-06-17): `eval_questions.py` (12-question gold set + 6 off-topic negatives, page-level labels verified against content) and `evaluate.py` (recall@k / hit@k / MRR, method comparison, floor + candidate_k tuning). Findings: hybrid beats the dense baseline at depth (hit@5 1.000, recall@5 0.861); multi-query *hurt* on this well-phrased set (kept conditional). Set from data, not guessed: `MAX_DISTANCE=0.69` (covered <=0.62 vs off-topic >=0.76) and `CANDIDATE_K=20`. The routing thresholds (`SHORT_QUESTION_WORDS`, `WEAK_MATCH_DISTANCE`) remain reasoned — proving selective expansion needs a vaguer question set.
+**Phase 7 — Evaluation** (built 2026-06-17): `eval_questions.py` (12-question gold set + 6 off-topic negatives, page-level labels verified against content) and `evaluate.py` (recall@k / hit@k / MRR, method comparison, floor + candidate_k tuning). Findings: hybrid beats the dense baseline at depth (hit@5 1.000, recall@5 0.861); multi-query *hurt* on this well-phrased set (kept conditional). Set from data, not guessed: `CANDIDATE_K=20` and the dense coverage floor. NOTE: the floor is embedder-specific — after the e5-small-v2 swap (DEVLOG T32) it was re-tuned from `0.69` (MiniLM scale) to `MAX_DISTANCE=0.22` (e5 scale: covered 0.11–0.21 vs off-topic 0.18–0.25, overlapping, so the floor preserves recall and the LLM refusal is the backstop). The routing thresholds (`SHORT_QUESTION_WORDS`, `WEAK_MATCH_DISTANCE`) remain reasoned — proving selective expansion needs a vaguer question set.
+
+**Large-scale benchmark + embedder upgrade** (DEVLOG T31/T32): a synthetic ground-truthed corpus (`bench_corpus.py` / `bench_eval.py`, up to ~7k chunks) showed dense retrieval was bottlenecked by the embedding model; an A/B (`bench_embedders.py`) picked **e5-small-v2**, lifting Phase-7 hybrid hit@1 0.50→0.92 / MRR 0.72→0.94. Switching embedders requires RE-INDEXING all corpora (query/passage vectors must share one model).
 
 ---
 
@@ -122,6 +124,8 @@ README.md, CLAUDE.md # stay at root by convention
 **Phase 8 — Frontend + demo** (web UI built 2026-06-17)
 - Web UI done: `app.py` (FastAPI) + `web/` (vanilla SPA) — home → new chat / previous chats, sidebar, add file/folder, ask → Locators, "cite this source". Verified end-to-end over HTTP (T21): create chat, ingest, refusal path, confirm, cite in all three styles. The *answered* LLM path needs Ollama with enough free memory (a demo blocker on a low-memory machine, not a code issue — see DEVLOG D8).
 - Remaining: README polish, architecture diagram, short demo video.
+
+**Phases 9–14 — Desktop-app re-architecture** (planned): ship CiteFinder as a single-user downloadable Windows app ([ADR 0006](docs/0006-single-user-desktop-app.md)) with a bundled Postgres, an ONNX embedder, self-managed services, and a runtime choice of local (Ollama) or bring-your-own-key cloud LLM ([ADR 0007](docs/0007-bundle-postgres-fetch-llm.md)). Current scope is the backend re-architecture (still browser-based); the native window + installer (Phases 15–17) are deferred. Full phase plan in [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ---
 

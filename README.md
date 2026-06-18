@@ -137,7 +137,7 @@ On the current gold set, hybrid retrieval reaches **hit@5 = 1.00** and **recall@
 ```
 *.py        # backend + entry points (run from the repo root)
 web/        # the vanilla SPA served by app.py
-docs/       # CONTEXT.md (glossary), DEVLOG.md, and the ADRs (0001–0005)
+docs/       # CONTEXT.md (glossary), DEVLOG.md, and the ADRs (0001–0007)
 data/       # your PDFs + uploads/  (gitignored)
 ```
 
@@ -151,7 +151,9 @@ The vocabulary lives in [docs/CONTEXT.md](docs/CONTEXT.md); the reasoning behind
 - **0003** — locate by default, cite on confirmation
 - **0004** — grounded tutor, only from your material
 - **0005** — a chat owns its corpus
+- **0006** — single-user desktop app (multi-user/hosted rejected)
+- **0007** — bundle Postgres, fetch the LLM on demand
 
 ## Status
 
-Working end-to-end: folder ingest → hybrid retrieval → grounded answer with Locators → confirm → cite, behind a web UI. Single-user by design for v1 (the data already partitions by user, so multi-user is an auth layer). See [docs/DEVLOG.md](docs/DEVLOG.md) for the build history.
+Working end-to-end: folder ingest → hybrid retrieval → grounded answer with Locators → confirm → cite, behind a web UI. **Single-user by design** — CiteFinder is a personal desktop app, not a hosted service ([ADR 0006](docs/0006-single-user-desktop-app.md)); the next milestone packages it as a downloadable Windows app with a bundled database and a choice of local or bring-your-own-key cloud LLM ([ADR 0007](docs/0007-bundle-postgres-fetch-llm.md)). See [docs/DEVLOG.md](docs/DEVLOG.md) for the build history.

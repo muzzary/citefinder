@@ -1,12 +1,5 @@
-from sentence_transformers import SentenceTransformer
 from db import connect
-
-# loads once; downloads the model the first time (~80MB), then cached
-model = SentenceTransformer("all-MiniLM-L6-v2")
-
-def embed_texts(texts):
-    """Turn a list of strings into a list of 384-dim vectors."""
-    return model.encode(texts, show_progress_bar=True)
+from embedder import embed
 
 def store_source(title, filename, user_id="user_1", author=None, year=None,
                  kind="work", confirmed=False, chat_id=None):
@@ -39,15 +32,22 @@ def store_chunks(chunks):
         return
 
     texts = [c["chunk_text"] for c in chunks]
-    vectors = embed_texts(texts)
+    vectors = embed(texts, kind="passage")   # e5 document prefix (see embedder.py)
 
+    # Batched insert (executemany) over one connection. NOTE: benchmarking showed
+    # ingest is embedding-bound (CPU ONNX, ~proportional to total tokens), not
+    # insert-bound — batching here is good practice and trims round trips, but the
+    # dominant cost is embed() above. The real ingest lever is the embedder, not SQL.
+    params = [
+        (c["source_id"], c["user_id"], c["page_number"], c["chunk_text"], vec)
+        for c, vec in zip(chunks, vectors)
+    ]
     with connect(register_vec=True) as conn, conn.cursor() as cur:
-        for c, vec in zip(chunks, vectors):
-            cur.execute(
-                "INSERT INTO chunks (source_id, user_id, page_number, chunk_text, embedding) "
-                "VALUES (%s,%s,%s,%s,%s);",
-                (c["source_id"], c["user_id"], c["page_number"], c["chunk_text"], vec),
-            )
+        cur.executemany(
+            "INSERT INTO chunks (source_id, user_id, page_number, chunk_text, embedding) "
+            "VALUES (%s,%s,%s,%s,%s);",
+            params,
+        )
 
     print(f"Stored {len(chunks)} chunks.")
 

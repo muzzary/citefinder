@@ -21,10 +21,36 @@ const API = {
   async source(id) { return get(`/api/sources/${id}`); },
   async confirm(id, body) { return post(`/api/sources/${id}/confirm`, body); },
   async cite(id, page, style) { return post(`/api/sources/${id}/cite`, { page, style }); },
+  async getSettings() { return get("/api/settings"); },
+  async putSettings(body) { return put("/api/settings", body); },
+  async testConn(body) { return post("/api/settings/test", body); },
+  async ollamaStatus() { return get("/api/ollama/status"); },
+  // Streaming pull: invokes onEvent(evt) for each progress line. Resolves on success.
+  async pullModel(model, onEvent) {
+    const r = await fetch("/api/ollama/pull", { method: "POST", headers: json(), body: JSON.stringify({ model }) });
+    if (!r.ok) throw new Error(`Pull failed (${r.status})`);
+    const reader = r.body.getReader();
+    const dec = new TextDecoder();
+    let buf = "";
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let nl;
+      while ((nl = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, nl).trim(); buf = buf.slice(nl + 1);
+        if (!line) continue;
+        const evt = JSON.parse(line);
+        if (evt.error) throw new Error(evt.error);
+        onEvent(evt);
+      }
+    }
+  },
 };
 
 async function get(url) { return handle(await fetch(url)); }
 async function post(url, body) { return handle(await fetch(url, { method: "POST", headers: json(), body: JSON.stringify(body) })); }
+async function put(url, body) { return handle(await fetch(url, { method: "PUT", headers: json(), body: JSON.stringify(body) })); }
 async function patch(url, body) { return handle(await fetch(url, { method: "PATCH", headers: json(), body: JSON.stringify(body) })); }
 async function del(url) { return handle(await fetch(url, { method: "DELETE" })); }
 function json() { return { "Content-Type": "application/json" }; }
@@ -89,6 +115,7 @@ function router() {
   const hash = location.hash || "#/";
   const m = hash.match(/^#\/chat\/(\d+)/);
   if (m) return renderChat(parseInt(m[1], 10));
+  if (hash.startsWith("#/new")) return renderChat(null);   // draft — not yet saved
   if (hash.startsWith("#/chats")) return renderList();
   return renderHome();
 }
@@ -96,12 +123,10 @@ window.addEventListener("hashchange", router);
 window.addEventListener("DOMContentLoaded", router);
 
 function go(hash) { location.hash = hash; }
-async function startNewChat() {
-  try {
-    const { id } = await API.createChat(null);
-    go(`#/chat/${id}`);
-  } catch (e) { toast(e.message, "err"); }
-}
+// "Start a new chat" opens a DRAFT (no row created). The chat is persisted only
+// when the user first does something — adds a file or asks — so empty Untitled
+// chats never accumulate in the list. See ensureChat() in renderChat.
+function startNewChat() { go("#/new"); }
 
 /* ===========================================================================
    HOME
@@ -114,7 +139,10 @@ function renderHome() {
           <span class="brand-mark">${icon("i-quote")}</span>
           <span class="brand-name">CiteFinder</span>
         </div>
-        <span class="home-tag">local · grounded · your material only</span>
+        <div class="home-top-r">
+          <span class="home-tag">local · grounded · your material only</span>
+          <button class="btn btn-quiet" id="home-settings" title="Model settings">${icon("i-gear")}</button>
+        </div>
       </header>
 
       <main class="home-center">
@@ -154,6 +182,7 @@ function renderHome() {
     </div>`;
   document.getElementById("opt-new").onclick = startNewChat;
   document.getElementById("opt-prev").onclick = () => go("#/chats");
+  document.getElementById("home-settings").onclick = () => openSettingsModal();
   typewriter();
 }
 
@@ -193,12 +222,14 @@ async function renderList() {
         </div>
         <div style="display:flex;gap:10px">
           <button class="btn btn-ghost" id="l-home">${icon("i-back")} Home</button>
+          <button class="btn btn-quiet" id="l-settings" title="Model settings">${icon("i-gear")}</button>
           <button class="btn btn-primary" id="l-new">${icon("i-plus")} New chat</button>
         </div>
       </div>
       <div id="l-body"></div>
     </div>`;
   document.getElementById("l-home").onclick = () => go("#/");
+  document.getElementById("l-settings").onclick = () => openSettingsModal();
   document.getElementById("l-new").onclick = startNewChat;
 
   const body = document.getElementById("l-body");
@@ -263,6 +294,7 @@ async function renderChat(chatId) {
           </div>
           <div class="main-actions">
             <button class="btn btn-ghost" id="c-files">${icon("i-folder")} <span id="c-files-n">Files</span></button>
+            <button class="btn btn-quiet" id="c-settings" title="Model settings">${icon("i-gear")}</button>
             <button class="btn btn-quiet" id="c-rename" title="Rename chat">${icon("i-pencil")}</button>
             <button class="btn btn-quiet" id="c-delete" title="Delete chat">${icon("i-trash")}</button>
           </div>
@@ -289,34 +321,51 @@ async function renderChat(chatId) {
     <input type="file" id="c-file-files" accept="application/pdf,.pdf" multiple class="hidden" />
     <input type="file" id="c-file-folder" webkitdirectory directory multiple class="hidden" />`;
 
+  // Draft mode: chatId is null until the user does something. ensureChat()
+  // lazily creates the row on first action (add files / ask) and swaps the URL
+  // to the real id WITHOUT a re-render, so the view continues uninterrupted.
+  let cid = chatId;
+  async function ensureChat() {
+    if (cid == null) {
+      const { id } = await API.createChat(null);
+      cid = id;
+      history.replaceState(null, "", `#/chat/${id}`);
+      refreshSidebar(cid);
+    }
+    return cid;
+  }
+
   // wiring
   document.getElementById("c-brand").onclick = () => go("#/");
   document.getElementById("c-back").onclick = () => go("#/chats");
   document.getElementById("c-new").onclick = startNewChat;
-  document.getElementById("c-files").onclick = () => openFilesModal(chatId);
-  document.getElementById("c-rename").onclick = () => startRename(chatId);
-  document.getElementById("c-delete").onclick = () => confirmDeleteChat(chatId);
+  document.getElementById("c-settings").onclick = () => openSettingsModal();
+  document.getElementById("c-files").onclick = () =>
+    cid == null ? toast("Add a file or ask a question to start this chat.", "err") : openFilesModal(cid);
+  document.getElementById("c-rename").onclick = () => { if (cid != null) startRename(cid); };
+  document.getElementById("c-delete").onclick = () =>
+    cid == null ? go("#/chats") : confirmDeleteChat(cid);
 
   const filesInput = document.getElementById("c-file-files");
   const folderInput = document.getElementById("c-file-folder");
   document.getElementById("c-addfiles").onclick = () => filesInput.click();
   document.getElementById("c-addfolder").onclick = () => folderInput.click();
-  filesInput.onchange = () => handleUpload(chatId, filesInput.files, "files");
-  folderInput.onchange = () => handleUpload(chatId, folderInput.files, "folder");
+  filesInput.onchange = async () => { await ensureChat(); handleUpload(cid, filesInput.files, "files"); };
+  folderInput.onchange = async () => { await ensureChat(); handleUpload(cid, folderInput.files, "folder"); };
 
   // composer behaviour
   const input = document.getElementById("c-input");
   const send = document.getElementById("c-send");
   const grow = () => { input.style.height = "auto"; input.style.height = Math.min(input.scrollHeight, 160) + "px"; };
   input.addEventListener("input", grow);
-  input.addEventListener("keydown", (e) => {
-    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); submitAsk(chatId); }
+  input.addEventListener("keydown", async (e) => {
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); await ensureChat(); submitAsk(cid); }
   });
-  send.onclick = () => submitAsk(chatId);
+  send.onclick = async () => { await ensureChat(); submitAsk(cid); };
 
-  await refreshSidebar(chatId);
-  await loadThread(chatId);
-  refreshFilesCount(chatId);
+  await refreshSidebar(cid);
+  if (cid == null) renderEmptyThread(cid);             // draft: no thread to load yet
+  else { await loadThread(cid); refreshFilesCount(cid); }
 }
 
 async function refreshFilesCount(chatId) {
@@ -655,6 +704,239 @@ function buildStylePicker(slot, sourceId, page, src) {
   };
 }
 
+/* ===========================================================================
+   SETTINGS — the LLM choice (Phase 13). Local (Ollama) or bring-your-own
+   OpenAI-compatible key; Groq is the recommended free option. Saved to
+   config.json server-side; takes effect on the next question (no restart).
+   =========================================================================== */
+const PROVIDERS = {
+  ollama:     { label: "Local model (Ollama)",            mode: "local", base_url: "http://localhost:11434/v1",   model: "phi4-mini",              key: false },
+  groq:       { label: "Groq — free, recommended",        mode: "cloud", base_url: "https://api.groq.com/openai/v1", model: "llama-3.3-70b-versatile", key: true },
+  openai:     { label: "OpenAI",                          mode: "cloud", base_url: "https://api.openai.com/v1",    model: "gpt-4o-mini",            key: true },
+  openrouter: { label: "OpenRouter",                      mode: "cloud", base_url: "https://openrouter.ai/api/v1", model: "",                       key: true },
+  custom:     { label: "Custom (any OpenAI-compatible)",  mode: "cloud", base_url: "",                             model: "",                       key: true },
+};
+
+function inferProvider(baseUrl) {
+  if (!baseUrl) return null;
+  for (const [k, v] of Object.entries(PROVIDERS))
+    if (v.base_url && baseUrl.startsWith(v.base_url)) return k;
+  return null;
+}
+
+async function openSettingsModal({ intro = "", onSaved } = {}) {
+  const body = document.createElement("div");
+  body.className = "settings-box";
+  body.innerHTML = `<div class="thinking"><span class="spin"></span> loading settings…</div>`;
+  const m = modal(intro ? "Choose how to answer" : "Model settings", body);
+
+  let cur;
+  try { cur = await API.getSettings(); }
+  catch (e) { body.innerHTML = `<p class="panel-err">${esc(e.message)}</p>`; return; }
+
+  // Start on the saved provider; an unconfigured install defaults to Groq (the
+  // free, no-download path) rather than a local model that needs a 2.5 GB pull.
+  let provider, base, model;
+  if (cur.configured) {
+    provider = cur.provider || inferProvider(cur.base_url) || "custom";
+    base = cur.base_url; model = cur.model;
+  } else {
+    provider = "groq"; base = PROVIDERS.groq.base_url; model = PROVIDERS.groq.model;
+  }
+  render();
+
+  function render() {
+    const p = PROVIDERS[provider];
+    const isLocal = p.mode === "local";
+    // Local uses the Ollama panel (status + model picker + download); both keep
+    // hidden f-base/f-model inputs so fields()/onSave/onTest stay uniform.
+    const middle = isLocal
+      ? `<input type="hidden" class="f-base" value="${esc(base || PROVIDERS.ollama.base_url)}" />
+         <input type="hidden" class="f-model" value="${esc(model)}" />
+         <div class="local-panel" id="local-panel"><div class="thinking"><span class="spin"></span> checking Ollama…</div></div>`
+      : `<div class="field"><label>Endpoint (base URL)</label><input class="f-base" value="${esc(base)}" placeholder="https://…/v1" /></div>
+         <div class="field"><label>Model</label><input class="f-model" value="${esc(model)}" placeholder="model name" /></div>
+         <div class="field f-keyfield">
+           <label>API key</label>
+           <input class="f-key" type="password" autocomplete="off" placeholder="${cur.has_key ? "key saved — leave blank to keep it" : "paste your key"}" />
+           ${provider === "groq" ? `<span class="settings-hint">Free key: console.groq.com → API Keys → Create key, then paste it here.</span>` : ""}
+         </div>`;
+    body.innerHTML = `
+      ${intro ? `<p class="settings-intro">${esc(intro)}</p>` : ""}
+      ${cur.env_locked ? `<div class="settings-note warn">${icon("i-x")}<span>The model is currently set by environment variables (dev mode). Saved choices won't take effect until those are unset.</span></div>` : ""}
+      <div class="field">
+        <label>Provider</label>
+        <select class="f-provider">
+          ${Object.entries(PROVIDERS).map(([k, v]) => `<option value="${k}" ${k === provider ? "selected" : ""}>${esc(v.label)}</option>`).join("")}
+        </select>
+      </div>
+      ${middle}
+      <div class="settings-note ${isLocal ? "ok" : "warn"}">
+        ${isLocal ? icon("i-cpu") : icon("i-cloud")}
+        <span>${isLocal
+          ? "Local mode keeps everything on your machine — your documents never leave it."
+          : "Cloud mode sends your question and the retrieved excerpts of your documents to this provider."}</span>
+      </div>
+      <div class="cite-panel-actions">
+        <button class="btn btn-ghost f-test">Test connection</button>
+        <button class="btn btn-primary f-save">${icon("i-check")} Save</button>
+        <span class="settings-result hidden f-result"></span>
+      </div>`;
+
+    const sel = body.querySelector(".f-provider");
+    sel.onchange = () => {
+      const baseEl = body.querySelector(".f-base"), modelEl = body.querySelector(".f-model");
+      base = baseEl ? baseEl.value.trim() : base;             // keep any edits
+      model = modelEl ? modelEl.value.trim() : model;
+      provider = sel.value;
+      if (provider !== "custom") { base = PROVIDERS[provider].base_url; model = PROVIDERS[provider].model; }
+      render();
+    };
+    body.querySelector(".f-test").onclick = onTest;
+    body.querySelector(".f-save").onclick = onSave;
+    if (isLocal) mountLocalPanel();
+  }
+
+  // ---- local (Ollama) panel ----
+  function setModel(id) {
+    model = id || "";
+    const el = body.querySelector(".f-model");
+    if (el) el.value = model;
+    body.querySelectorAll(".model-row").forEach((r) =>
+      r.classList.toggle("sel", r.dataset.id === model));
+  }
+
+  function isPulled(id, models) {
+    const want = id.includes(":") ? id : id + ":latest";
+    return models.includes(want) || models.includes(id);
+  }
+
+  async function mountLocalPanel() {
+    const host = body.querySelector("#local-panel");
+    if (!host) return;
+    let st;
+    try { st = await API.ollamaStatus(); }
+    catch { host.innerHTML = `<div class="settings-note warn">${icon("i-x")}<span>Couldn't check Ollama status.</span></div>`; return; }
+
+    if (!st.running) {
+      host.innerHTML = `
+        <div class="settings-note warn">${icon("i-cpu")}<span>Ollama isn't running. ${st.installed
+          ? "Start the Ollama app, then re-check."
+          : `Install it from <a href="${st.download_url}" target="_blank" rel="noopener">ollama.com/download</a>, then re-check.`}</span></div>
+        <button class="btn btn-ghost" id="ol-recheck">Re-check</button>`;
+      host.querySelector("#ol-recheck").onclick = mountLocalPanel;
+      return;
+    }
+
+    // running: catalog + any extra already-pulled models the user has
+    const catIds = new Set(st.catalog.map((c) => c.id));
+    const extra = st.models
+      .filter((m) => !catIds.has(m) && !catIds.has(m.replace(/:latest$/, "")))
+      .map((m) => ({ id: m, label: m, size: "", ram: "already installed" }));
+    const rows = [...st.catalog, ...extra];
+
+    host.innerHTML = `<div class="model-list">${rows.map((r) => {
+      const pulled = isPulled(r.id, st.models);
+      return `<div class="model-row" data-id="${esc(r.id)}" data-pulled="${pulled ? 1 : 0}">
+        <button class="model-pick" title="Use this model">
+          <span class="model-dot"></span>
+          <span class="model-meta"><span class="model-name">${esc(r.label)}</span>
+          <span class="model-sub">${esc([r.size, r.ram].filter(Boolean).join(" · "))}</span></span>
+        </button>
+        <div class="model-right">
+          ${pulled ? `<span class="fbadge ok">${icon("i-check")} ready</span>`
+                   : `<button class="btn btn-ghost model-dl">Download</button>`}
+        </div>
+        <div class="model-bar hidden"><div class="bar-fill"></div><span class="bar-label"></span></div>
+      </div>`;
+    }).join("")}</div>`;
+
+    host.querySelectorAll(".model-row").forEach((row) => {
+      const id = row.dataset.id;
+      const pick = row.querySelector(".model-pick");
+      if (row.dataset.pulled === "1") pick.onclick = () => setModel(id);
+      else pick.onclick = () => toast("Download this model first to use it.", "err");
+      const dl = row.querySelector(".model-dl");
+      if (dl) dl.onclick = () => downloadModel(id, row);
+    });
+
+    // keep current selection if it's pulled, else pick the first ready model
+    if (model && isPulled(model, st.models)) setModel(model);
+    else { const first = rows.find((r) => isPulled(r.id, st.models)); if (first) setModel(first.id); }
+  }
+
+  async function downloadModel(id, row) {
+    const dl = row.querySelector(".model-dl");
+    const bar = row.querySelector(".model-bar");
+    const fill = bar.querySelector(".bar-fill");
+    const label = bar.querySelector(".bar-label");
+    dl.disabled = true; dl.textContent = "Starting…";
+    bar.classList.remove("hidden");
+    try {
+      await API.pullModel(id, (evt) => {
+        const pct = evt.percent;
+        if (pct != null) fill.style.width = pct + "%";
+        label.textContent = pct != null ? `${evt.status || "downloading"} · ${pct}%` : (evt.status || "");
+      });
+      fill.style.width = "100%"; label.textContent = "ready";
+      toast(`Model "${id}" downloaded.`, "ok");
+      await mountLocalPanel();   // refresh: now selectable
+      setModel(id);
+    } catch (e) {
+      toast(`Download failed: ${e.message}`, "err");
+      dl.disabled = false; dl.textContent = "Download";
+    }
+  }
+
+  function fields() {
+    const keyEl = body.querySelector(".f-key");
+    return {
+      base_url: body.querySelector(".f-base").value.trim(),
+      model: body.querySelector(".f-model").value.trim(),
+      api_key: keyEl ? keyEl.value.trim() : "",
+    };
+  }
+
+  async function onTest() {
+    const { base_url, model: mdl, api_key } = fields();
+    const res = body.querySelector(".f-result");
+    if (!base_url || !mdl) return showResult(res, false, "Endpoint and model are required.");
+    const btn = body.querySelector(".f-test");
+    btn.disabled = true; btn.innerHTML = `<span class="mini-spin"></span> Testing`;
+    try {
+      const r = await API.testConn({ base_url, model: mdl, api_key: api_key || null });
+      showResult(res, r.ok, r.ok ? r.detail : `Failed: ${(r.detail || "").slice(0, 160)}`);
+    } catch (e) { showResult(res, false, e.message); }
+    finally { btn.disabled = false; btn.textContent = "Test connection"; }
+  }
+
+  async function onSave() {
+    const p = PROVIDERS[provider];
+    const { base_url, model: mdl, api_key } = fields();
+    const res = body.querySelector(".f-result");
+    if (!base_url || !mdl) return showResult(res, false, "Endpoint and model are required.");
+    if (p.mode === "cloud" && !cur.has_key && !api_key)
+      return showResult(res, false, "An API key is required for a cloud provider.");
+    const btn = body.querySelector(".f-save");
+    btn.disabled = true; btn.innerHTML = `<span class="mini-spin"></span> Saving`;
+    try {
+      await API.putSettings({ mode: p.mode, provider, base_url, model: mdl, api_key: api_key || null });
+      toast("Model settings saved.", "ok");
+      m.close();
+      onSaved && onSaved();
+    } catch (e) {
+      showResult(res, false, e.message);
+      btn.disabled = false; btn.innerHTML = `${icon("i-check")} Save`;
+    }
+  }
+}
+
+function showResult(el, ok, msg) {
+  el.className = `settings-result ${ok ? "ok" : "err"}`;
+  el.textContent = msg;
+  el.classList.remove("hidden");
+}
+
 /* ---- asking -------------------------------------------------------------- */
 let asking = false;
 async function submitAsk(chatId) {
@@ -674,7 +956,8 @@ async function submitAsk(chatId) {
     inner = document.getElementById("c-inner");
   }
 
-  inner.appendChild(renderMessage({ role: "user", content: q }));
+  const userMsg = renderMessage({ role: "user", content: q });
+  inner.appendChild(userMsg);
   input.value = ""; input.style.height = "auto";
 
   const pending = document.createElement("div");
@@ -686,6 +969,17 @@ async function submitAsk(chatId) {
 
   try {
     const res = await API.ask(chatId, q);
+    // Gate: no LLM configured yet (ADR 0007). Roll back this turn, restore the
+    // question, and open the "choose how to answer" step; retry once saved.
+    if (res.needs_setup) {
+      userMsg.remove(); pending.remove();
+      input.value = q; input.style.height = "auto";
+      openSettingsModal({
+        intro: "CiteFinder needs a model to answer. Choose a local model (private, downloads ~2.5 GB) or paste a cloud API key (fast — a free Groq key works). You can change this anytime via the gear icon.",
+        onSaved: () => submitAsk(chatId),
+      });
+      return;
+    }
     pending.replaceWith(renderMessage({ role: "assistant", content: res.answer, attribution: res.attribution, refused: res.refused }));
     refreshSidebar(chatId);   // first question may have set the title
   } catch (e) {
