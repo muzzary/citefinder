@@ -28,7 +28,7 @@ Two integrity rules drive the whole design:
 
 ```
 INGEST   PDF ─▶ extract text per page ─▶ chunk + tag (page/source/chat)
-            ─▶ embed locally (all-MiniLM-L6-v2) ─▶ store vectors in pgvector
+            ─▶ embed locally (e5-small-v2, ONNX) ─▶ store vectors in pgvector
 
 QUERY    question ─▶ embed ─▶ hybrid retrieve (dense + keyword, RRF)
             ─▶ refuse if nothing is covered
@@ -42,7 +42,7 @@ QUERY    question ─▶ embed ─▶ hybrid retrieve (dense + keyword, RRF)
 |------|--------|
 | Backend | Python, FastAPI |
 | Vector store | PostgreSQL + pgvector (Docker) |
-| Embeddings | `sentence-transformers` `all-MiniLM-L6-v2` (local, CPU) |
+| Embeddings | `e5-small-v2` via ONNX Runtime (local, CPU, torch-free; 384-dim) |
 | LLM | Ollama (Phi-4 Mini) by default; any OpenAI-compatible endpoint (e.g. Groq) |
 | PDF parsing | pypdf |
 | Frontend | Vanilla SPA (no build step) served by FastAPI |
