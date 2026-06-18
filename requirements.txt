@@ -13,3 +13,5 @@ numpy
 pypdf
 openai
 python-dotenv
+# Native desktop window (Phase 15) — uses the OS Edge WebView2 runtime on Windows.
+pywebview
