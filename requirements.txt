@@ -4,7 +4,12 @@ uvicorn
 pydantic
 psycopg[binary]
 pgvector
-sentence-transformers
+# Local embeddings via ONNX Runtime — deliberately NOT sentence-transformers /
+# torch (hundreds of MB to multiple GB). See ADR 0007 and embedder.py.
+onnxruntime
+tokenizers
+huggingface_hub
+numpy
 pypdf
 openai
 python-dotenv
