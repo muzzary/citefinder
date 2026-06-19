@@ -127,8 +127,19 @@ def main():
     if icon:
         # The Form doesn't exist until the window is shown; set the icon then.
         window.events.shown += lambda: _apply_window_icon(window, icon)
+
+    # Pin the WebView2 profile to a FIXED folder under app-data. In private mode
+    # (pywebview's default) WebView2 spins up a brand-new profile in %TEMP%
+    # (\tmpXXXX\EBWebView) on EVERY launch and never cleans it up, so repeated
+    # opens slowly leak disk on the system drive. A persistent storage_path reuses
+    # one profile and, because it lives under app-data, follows CITEFINDER_HOME
+    # (so it can sit on another drive instead of C). Falls back gracefully on an
+    # older pywebview that lacks these arguments.
     try:
-        webview.start()          # blocks on the main thread until the window closes
+        from appdata import app_data_dir
+        webview.start(private_mode=False, storage_path=str(app_data_dir() / "webview"))
+    except TypeError:
+        webview.start()          # older pywebview: no private_mode/storage_path
     finally:
         shutdown(server)
 
