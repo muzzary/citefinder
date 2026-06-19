@@ -62,14 +62,26 @@ def llm_config() -> dict:
     }
 
 
-def load_config() -> dict:
-    """The full config.json as a dict (for the Settings UI to read back)."""
-    return _config_file()
-
-
 def save_config(data: dict) -> None:
-    """Persist the full config dict to config.json (Phase 13 Settings UI writes here)."""
-    with open(config_path(), "w", encoding="utf-8") as f:
+    """Persist the full config dict to config.json (the Settings UI writes here).
+
+    Guard against silent data loss: callers build `data` from `_config_file()`,
+    which returns {} for a corrupt file — so if config.json existed but was
+    unparseable, a naive overwrite would drop every previously-saved key (e.g.
+    `db`). If the on-disk file is present but won't parse, move it aside to
+    `config.json.corrupt` first so it can be recovered, then write fresh.
+    """
+    path = config_path()
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                json.load(f)
+        except (json.JSONDecodeError, OSError):
+            try:
+                os.replace(path, str(path) + ".corrupt")
+            except OSError:
+                pass
+    with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
 
 

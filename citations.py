@@ -38,10 +38,16 @@ def render_locator(loc):
     return "\n".join(lines)
 
 
+import re
 from datetime import date, datetime
 
 WORK_TYPES = ("book", "article", "website")
 STYLES = ("APA", "Harvard", "IEEE")
+
+# Author "initials" look like "J.", "J. A.", "H. M. H." — one or more single
+# capital letters each followed by a dot. Used to pair a surname with its
+# initials when splitting a multi-author string (see _split_authors).
+_INITIALS_RE = re.compile(r"^[A-Z]\.(?:\s*[A-Z]\.)*$")
 
 
 # --- author-name helpers -----------------------------------------------------
@@ -51,14 +57,36 @@ STYLES = ("APA", "Harvard", "IEEE")
 # derive those views WITHOUT inventing anything — they only reshape what's typed.
 
 def _split_authors(author):
-    """Split a multi-author string into individual authors. Authors are separated
-    by '&', ';', or ' and ' (the comma inside 'Smith, J.' is NOT a separator)."""
+    """Split a reference-list author string into individual authors.
+
+    Handles the forms students and CrossRef actually produce:
+      "Khan, H. M. H."                     -> 1
+      "Taylor, R., & Jones, M."            -> 2
+      "Smith, J. A., Doe, A., & Roe, B."   -> 3   (comma-separated, '&' before last)
+      "World Health Organization"          -> 1   (group/org, no comma)
+
+    The hard part: a comma separates BOTH a surname from its initials AND one
+    author from the next. So we flatten the explicit separators (';', '&',
+    ' and ') to commas, then walk the comma tokens pairing a surname with a
+    FOLLOWING initials token ("Doe" + "A." -> "Doe, A."); a token that isn't
+    initials starts a new author (so a lone surname or an org name stands alone).
+    Previously this split only on '&'/';'/' and ', which silently merged the
+    middle authors of any 3+ author list — corrupting the in-text and IEEE forms.
+    """
     s = (author or "").strip()
     if not s:
         return []
-    for sep in (" & ", " and ", "&", ";"):
-        s = s.replace(sep, "|")
-    return [p.strip().strip(",").strip() for p in s.split("|") if p.strip()]
+    s = re.sub(r"\s*(?:;|&|\band\b)\s*", ", ", s)        # unify separators to ", "
+    tokens = [t.strip() for t in s.split(",") if t.strip()]
+    authors, i = [], 0
+    while i < len(tokens):
+        name = tokens[i]
+        i += 1
+        if i < len(tokens) and _INITIALS_RE.match(tokens[i]):
+            name = f"{name}, {tokens[i]}"
+            i += 1
+        authors.append(name)
+    return authors
 
 
 def _surname(one):
@@ -289,3 +317,23 @@ if __name__ == "__main__":
             c = format_citation({**base, "work_type": wt}, style=style)
             print(f"  {style:8} in-text : {c['in_text']}")
             print(f"  {' ':8} ref     : {c['reference']}")
+
+    # Author-splitting regression (1/2/3+/org) — the multi-author parse is easy to
+    # break and feeds every in-text + IEEE citation.
+    print("\n=== author split ===")
+    cases = {
+        "Khan, H. M. H.": (["Khan, H. M. H."], "Khan"),
+        "Taylor, R., & Jones, M.": (["Taylor, R.", "Jones, M."], "Taylor & Jones"),
+        "Smith, J. A., Doe, A., & Roe, B.":
+            (["Smith, J. A.", "Doe, A.", "Roe, B."], "Smith et al."),
+        "World Health Organization":
+            (["World Health Organization"], "World Health Organization"),
+    }
+    ok = True
+    for raw, (want_split, want_intext) in cases.items():
+        got_split = _split_authors(raw)
+        got_intext = _intext_authors(raw, "&")
+        passed = got_split == want_split and got_intext == want_intext
+        ok = ok and passed
+        print(f"  [{'PASS' if passed else 'FAIL'}] {raw!r} -> {got_intext!r}")
+    print("AUTHORS ALL PASS:", ok)
