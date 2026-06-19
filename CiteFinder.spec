@@ -28,6 +28,7 @@ datas = [
     ("web", "web"),                                             # the SPA
     (_onnx, "model"),                                           # -> model/model.onnx
     (_tok, "model"),                                            # -> model/tokenizer.json
+    ("citefinder.ico", "."),                                    # app icon (desktop.py reads it)
     (str(ROOT / "vendor" / "pgextract" / "pgsql"), "pgsql"),    # portable PG + pgvector
 ]
 binaries = []
@@ -69,5 +70,6 @@ exe = EXE(
     exclude_binaries=True,
     name="CiteFinder",
     console=False,            # windowed desktop app (no console)
+    icon="citefinder.ico",    # the .exe / taskbar / installer icon (see make_icon.py)
 )
 coll = COLLECT(exe, a.binaries, a.datas, name="CiteFinder")
