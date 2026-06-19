@@ -1,0 +1,5 @@
+# Build-time / dev-only tools — NOT runtime dependencies (keep these out of the
+# shipped app and out of requirements.txt). Install when building a release:
+#   venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+Pillow        # make_icon.py — generates citefinder.ico
+pyinstaller   # CiteFinder.spec — builds the onedir bundle (Phase 16)
