@@ -1,10 +1,12 @@
 import os
 import glob
 
-from metadata import extract_metadata
+import psycopg
+
+from metadata import extract_metadata, extract_doi
 from ingest import extract_pdf_pages
 from chunk import chunk_pages
-from embed_store import store_source, store_chunks
+from embed_store import store_source_and_chunks
 
 
 def ingest_pdf(pdf_path, user_id="user_1", chat_id=None, kind="work",
@@ -59,20 +61,35 @@ def ingest_pdf(pdf_path, user_id="user_1", chat_id=None, kind="work",
     if not title:
         title = base
 
-    # 3. Store the source row, then tag the chunks with its real id.
     if kind == "notes":
         author = year = None
         confirmed = False
-    source_id = store_source(
-        title=title, filename=base, user_id=user_id,
-        author=author or None, year=year or None,
-        kind=kind, confirmed=confirmed, chat_id=chat_id,
-    )
-    for c in chunks:
-        c["source_id"] = source_id
 
-    # 4. Embed -> store
-    store_chunks(chunks)
+    # 2b. Detect a DOI on the first pages (cheap, offline) so the confirm UI can
+    #     offer a one-click CrossRef auto-fill. Most journal PDFs print it up front.
+    doi = ""
+    try:
+        head = " ".join(p["page_text"] for p in pages[:2] if not p["is_scanned"])
+        doi = extract_doi(head)
+    except Exception:
+        pass
+
+    # 3. Embed + store the source and its chunks atomically (one transaction), so
+    #    the source never appears half-ingested and a delete (of the file or its
+    #    chat) racing this ingest can't orphan the chunk insert. A delete that wins
+    #    the race makes the source/chat FK fail here — we report it cleanly instead
+    #    of crashing the request.
+    try:
+        source_id = store_source_and_chunks(
+            title=title, filename=base, user_id=user_id,
+            author=author or None, year=year or None,
+            kind=kind, confirmed=confirmed, chat_id=chat_id,
+            doi=doi or None, chunks=chunks,
+        )
+    except psycopg.errors.ForeignKeyViolation:
+        return {"status": "error", "source_id": None, "chunks": 0,
+                "title": title, "filename": base,
+                "reason": "the chat was removed while this file was being added"}
 
     return {"status": "stored", "source_id": source_id, "chunks": len(chunks),
             "title": title, "filename": base, "reason": None}

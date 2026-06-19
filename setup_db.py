@@ -26,6 +26,23 @@ def setup():
         cur.execute("ALTER TABLE sources ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'work';")
         cur.execute("ALTER TABLE sources ADD COLUMN IF NOT EXISTS confirmed BOOLEAN NOT NULL DEFAULT FALSE;")
 
+        # Citation typing (see citations.py). work_type picks the reference shape
+        #   book | article | website
+        # and cite_meta (JSONB) holds the fields that shape needs but the common
+        # columns (author/title/year) don't carry — publisher/place/edition for a
+        # book, journal/volume/issue/pages/doi for an article, site_name/url/
+        # pub_date/accessed for a website. JSONB (not 10 sparse columns) keeps the
+        # per-type fields together and lets the set grow without a migration each
+        # time. author/title/year stay as columns: they're shared by all types and
+        # gate `confirmed`.
+        cur.execute("ALTER TABLE sources ADD COLUMN IF NOT EXISTS work_type TEXT NOT NULL DEFAULT 'book';")
+        cur.execute("ALTER TABLE sources ADD COLUMN IF NOT EXISTS cite_meta JSONB;")
+
+        # The DOI auto-detected from the PDF's first pages at ingest (metadata.py).
+        # Not a citation field itself — it's the KEY the confirm UI uses to offer a
+        # one-click CrossRef lookup that fills the citation fields (see crossref.py).
+        cur.execute("ALTER TABLE sources ADD COLUMN IF NOT EXISTS doi TEXT;")
+
         # chunks table: many rows per source, each with its vector + page
         # vector(384) MUST match the embedding model's output size
         cur.execute("""

@@ -270,6 +270,9 @@ input, textarea { font-family: inherit; color: inherit; }
 .citation-out { margin-top: 12px; border: 1px solid var(--accent-line); background: var(--accent-soft); border-radius: 11px; padding: 13px 15px; animation: rise 0.4s var(--ease) both; }
 .citation-style { font-family: var(--font-mono); font-size: 10.5px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--accent); margin-bottom: 6px; }
 .citation-text { font-family: var(--font-mono); font-size: 13px; color: var(--text); line-height: 1.6; }
+/* in-text + reference-list rows of a rendered citation */
+.cite-line { display: flex; flex-direction: column; gap: 2px; margin-top: 9px; }
+.cite-lbl { font-family: var(--font-mono); font-size: 9.5px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--text-3); }
 
 /* style picker + confirm form (inline within locator) */
 .cite-panel { margin-top: 12px; border-top: 1px dashed var(--line-2); padding-top: 13px; display: flex; flex-direction: column; gap: 12px; animation: rise 0.35s var(--ease) both; }
@@ -283,6 +286,12 @@ input, textarea { font-family: inherit; color: inherit; }
 .chip { font-family: var(--font-mono); font-size: 12px; padding: 7px 13px; border-radius: 9px; border: 1px solid var(--line); background: var(--surface-2); color: var(--text-2); transition: all 0.18s var(--ease); }
 .chip:hover { border-color: var(--line-2); color: var(--text); }
 .chip.sel { background: var(--accent); color: #06231a; border-color: var(--accent); font-weight: 600; }
+.doi-row { display: flex; gap: 8px; align-items: stretch; }
+.doi-row .f-doi { flex: 1; font-family: var(--font-mono); font-size: 13px; }
+.doi-row .f-doi-go { white-space: nowrap; flex: none; }
+.doi-hint { font-family: var(--font-mono); font-size: 12px; margin-top: 2px; }
+.doi-hint.ok { color: var(--accent); }
+.doi-hint.err { color: var(--danger); }
 .cite-panel-actions { display: flex; gap: 10px; align-items: center; }
 .panel-err { color: var(--danger); font-size: 12.5px; font-family: var(--font-mono); }
 

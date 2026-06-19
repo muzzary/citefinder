@@ -52,6 +52,53 @@ def store_chunks(chunks):
     print(f"Stored {len(chunks)} chunks.")
 
 
+def store_source_and_chunks(*, title, filename, user_id="user_1", author=None,
+                            year=None, kind="work", confirmed=False, chat_id=None,
+                            doi=None, chunks):
+    """
+    Atomic ingest: embed the chunks, then insert the source row AND all its chunks
+    in ONE transaction, returning the new source_id.
+
+    Why atomic: store_source used to commit the source row on its own, then
+    store_chunks ran a second (slow) transaction to embed + insert. That left a
+    window where a half-ingested source was already visible — deleting it (or its
+    chat) mid-ingest removed the row, and the in-flight chunk insert then hit a
+    foreign-key violation. Committing source + chunks together closes the window:
+    the source only becomes visible once its chunks are in, so it can't be deleted
+    underneath the insert, and any failure (e.g. the chat was deleted during the
+    embed) rolls back cleanly with nothing orphaned.
+
+    Embedding happens BEFORE the transaction opens, so the DB connection isn't held
+    during the slow CPU work — only the fast writes are inside the transaction.
+    """
+    complete = author is not None and year is not None
+    if kind == "notes":
+        confirmed = False
+
+    texts = [c["chunk_text"] for c in chunks]
+    vectors = embed(texts, kind="passage") if texts else []   # slow; outside the txn
+
+    with connect(register_vec=True) as conn, conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO sources "
+            "(user_id, title, author, year, filename, metadata_complete, kind, confirmed, chat_id, doi) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id;",
+            (user_id, title, author, year, filename, complete, kind, confirmed, chat_id, doi or None),
+        )
+        source_id = cur.fetchone()[0]
+        if chunks:
+            params = [
+                (source_id, c["user_id"], c["page_number"], c["chunk_text"], vec)
+                for c, vec in zip(chunks, vectors)
+            ]
+            cur.executemany(
+                "INSERT INTO chunks (source_id, user_id, page_number, chunk_text, embedding) "
+                "VALUES (%s,%s,%s,%s,%s);",
+                params,
+            )
+    return source_id
+
+
 # --- quick test: full ingest of one PDF ---
 if __name__ == "__main__":
     from ingest import extract_pdf_pages

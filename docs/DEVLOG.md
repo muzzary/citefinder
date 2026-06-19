@@ -6,6 +6,125 @@ and the ADRs (`0001`–`0007`).
 
 ---
 
+## Post-Phase-16 — citation engine v2, DOI auto-fill, ingest hardening, desktop polish
+
+A round of product fixes after the first packaged build, driven by real use: the
+citation feature only handled a book-shaped record and made the student type
+everything by hand; uploads could duplicate; there was no per-file delete; a
+delete racing an ingest threw FK errors; embeddings felt slow; and the desktop app
+showed the generic Python icon.
+
+### 1. What was done
+
+**Citation engine v2 — work-type aware (book | article | website).**
+- Schema: `sources.work_type` (book|article|website) + `sources.cite_meta` (JSONB)
+  hold the per-type fields beyond the shared author/title/year (publisher/place/
+  edition · journal/volume/issue/pages/doi · site_name/url/pub_date/accessed).
+- `citations.format_citation(meta, style)` rewritten: returns **both**
+  `{in_text, reference}` for **APA / Harvard / IEEE × book/article/website** (9
+  shapes), matching the agreed templates exactly. Surname extraction for in-text,
+  initials-first flip for IEEE, graceful omission of blank optional fields. Two
+  deliberate calls: in-text carries **no page** (templates omit it); titles render
+  **verbatim** (no auto-recasing — it would mangle acronyms).
+- `sources.confirm_source(..., work_type, meta)` keeps only the fields valid for
+  the chosen type (blanks dropped); author+year+real-title still gate `confirmed`,
+  the type-specific fields only enrich. `cite_source` returns the two-form dict.
+- UI: the confirm form gained a **type picker** + per-type fields; the rendered
+  citation shows **In-text** and **Reference list** rows.
+
+**DOI → CrossRef auto-fill (the "find" in CiteFinder).** Most journal PDFs print a
+DOI on page 1. `metadata.extract_doi` detects it at ingest and stores it
+(`sources.doi`); the confirm form's **"Auto-fill from DOI"** button calls
+`crossref.lookup_doi` (`/api/lookup-doi`) and pre-fills authoritative author/title/
+year/journal/volume/issue/pages, which the student then verifies. Only the DOI
+string leaves the machine, only on the button click (ADR 0002); still confirmed
+manually (ADR 0003). stdlib `urllib`, no new dependency.
+
+**Metadata auto-extract on the web path.** The web upload never extracted the
+embedded-PDF metadata guess (only the CLI folder path did, and only the title), so
+the confirm form opened blank — contradicting ADR 0003's "auto-extracted as a
+guess". `app.upload` now extracts title/author/year (stored UNCONFIRMED) so the
+form pre-fills; the year is honestly flagged as the file's creation date, not the
+publication year.
+
+**Ingest hardening (atomic).** `embed_store.store_source_and_chunks` embeds first,
+then inserts the source row + all its chunks in ONE transaction. Previously the
+source committed first and the slow chunk insert ran second, leaving a window where
+deleting the file (or its chat) mid-ingest orphaned the chunk insert with an FK
+violation. Now the source only becomes visible once its chunks land; a delete that
+wins the race rolls the whole ingest back and `ingest_pdf` reports it cleanly.
+
+**Per-file delete + duplicate guard.** `sources.delete_source` + `DELETE
+/api/sources/{id}` (removes the source, its chunks via cascade, and the PDF on
+disk) wired to a trash button per file in the Files menu; past answers keep their
+stored Locator snapshots. `app.upload` now **skips a PDF whose name is already in
+the chat** (re-upload / same file twice in a folder) instead of making a second
+copy.
+
+**Embedding speed.** Measured before changing: on this 4-core box, fp32 e5 runs
+~9.5 chunks/s, forcing all-threads/opt gives **no gain** (ORT already uses all
+cores), and the int8-quantized model is **slower** (8.1 ch/s — no fast int8 path) —
+so per-chunk inference is at the hardware floor. The wins were on **load**:
+`embedder` now loads from the local HF cache with `local_files_only=True` first (no
+per-startup network revalidation), and `app.py` **pre-warms** the model in a
+background thread at boot so the first upload doesn't pay the cold start.
+
+**Desktop app icon.** `make_icon.py` generates `citefinder.ico` — a bold
+quotation mark (the citation symbol) in dark on the emerald tile. `desktop.py` sets
+an explicit Windows AppUserModelID and applies the icon to the native window at
+runtime (fixes the taskbar icon for the dev/bat run immediately); `CiteFinder.spec`
+sets it as the exe/installer icon and bundles the `.ico` (needs a repackage for the
+installed app). First attempt reused the in-app "spark" glyph, which read as a
+loading spinner — replaced with the quotation mark.
+
+### 2. Tests
+
+**T42 — citation formatter, all 9 shapes (`python citations.py`)**
+- Output for {book, article, website} × {APA, Harvard, IEEE} matched the target
+  templates field-for-field — e.g. APA book `Smith, J. (2020). … Academic Press.`,
+  Harvard article `… 14(2), pp. 112–125. Available at: … [Accessed 19 June 2026].`,
+  IEEE website `[1] WHO. "…" WHO. who.int (accessed Jun. 19, 2026).`
+- Fixed two template mismatches found in review: APA adds a period after a group
+  author (`World Health Organization.`); IEEE book ends the title with a period
+  (not a comma) when there's no edition.
+
+**T41 — confirm/cite round-trip (real DB)**
+- Confirmed a throwaway source as an **article** with type fields → `work_type`
+  stored, `cite_meta` JSONB round-tripped, an invalid-for-type field (`publisher`)
+  correctly **dropped**; all three styles rendered from the stored row.
+
+**T40 — atomic ingest + delete race (real DB)**
+- Pre: a chat with 2 synthetic chunks. Normal `store_source_and_chunks` → source +
+  2 chunks present. Cascade: deleting the chat removed the chunks.
+- Race: chat deleted **before** the ingest commit → `ForeignKeyViolation` raised
+  (caught by `ingest_pdf`) and **0 orphan source rows** left. Atomic rollback holds.
+
+**T39 — embedding benchmark (this 4-core machine)**
+- fp32 default **9.5 ch/s**; all-threads + `ORT_ENABLE_ALL` **9.1 ch/s** (no gain,
+  ORT already uses all cores); int8-quantized **8.1 ch/s** (slower). Mean cosine
+  fp32-vs-quantized **0.9982** — accuracy would've been fine, but it's not faster
+  here, so quantization was rejected. Conclusion: inference is at the hardware
+  floor; optimise load, not the model.
+
+**T38 — CrossRef lookup (live)**
+- `crossref.lookup_doi("10.1016/j.ijnurstu.2019.103412")` → correct authors
+  (`Baker, J. A., Canvin, K., & Berzins, K.`), title, journal, vol 100, year 2019.
+- `POST /api/lookup-doi` over HTTP with a `https://doi.org/…` URL → 200 with the
+  normalized fields (URL-form DOI cleaned to bare form).
+
+**T37 — bug + regression: confirm stuck on "Saving"**
+- Symptom (server log): `POST /api/sources/558/confirm → 200 OK` but the Files-menu
+  form sat on "Saving". Root cause: the success handler swapped the badge but never
+  removed the form (it's appended to the row, not inside the swapped element), so
+  the button never reset. Fix: collapse the form on success, keep the delete
+  button, and sync local state. (Also surfaced the ingest FK violations that
+  motivated T40's atomic hardening.)
+
+- Icon verified by rendering the `.ico` to PNG and eyeballing (clean quotation mark);
+  the native-window taskbar icon needs an interactive run of `run_citefinder.bat`.
+
+---
+
 ## Phase 16 — packaging: PyInstaller bundle + Inno Setup installer
 
 ### 1. What was done
