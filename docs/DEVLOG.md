@@ -6,6 +6,41 @@ and the ADRs (`0001`–`0007`).
 
 ---
 
+## v1.1.1 - WebView2 profile leak fix
+
+### 1. What was done
+
+A user-reported issue: the installed app hung on launch and the C drive filled up.
+Diagnosis (logs + disk audit): the machine's C drive was chronically near-full
+(~3.4 GB free, mostly Docker / browser / other apps, NOT CiteFinder, whose data
+was ~66 MB), and a near-full system drive is what stalled startup. But it surfaced
+a real CiteFinder bug:
+
+- **WebView2 profile leak.** `desktop.py` started pywebview in its default private
+  mode, so WebView2 created a BRAND-NEW profile in `%TEMP%\tmpXXXX\EBWebView` on
+  every launch and never removed it (the machine had several stacked up). Fixed by
+  pinning a persistent `storage_path` under app-data (`webview.start(private_mode=
+  False, storage_path=app_data_dir()/"webview")`), so one profile is reused and it
+  follows `CITEFINDER_HOME` (can live off C). Falls back if the pywebview build
+  lacks those args.
+- Mitigations applied on the affected machine: set `CITEFINDER_HOME=D:\CiteFinderData`
+  (User env var) so all app data lives on D, stopped the orphaned Postgres, and
+  cleared the leaked temp profiles.
+- `sign.ps1` added: a one-command Authenticode signing helper (SHA-256 + RFC-3161
+  timestamp) for when an OV/EV cert is available. 1.1.1 ships unsigned for now
+  (SmartScreen "Run anyway"), as documented.
+- Version bumped to 1.1.1 and the installer rebuilt.
+
+### 2. Tests
+
+**T44 - 1.1.1 rebuild + WebView2 fix**
+- `desktop.py` compiles; the storage_path call is guarded for older pywebview.
+- Rebuilt the onedir + installer as `CiteFinder-Setup-1.1.1.exe`.
+- The fix is verified behaviourally by installing 1.1.1 and confirming no new
+  `%TEMP%\tmp*\EBWebView` appears across repeated launches (manual, post-install).
+
+---
+
 ## Phase 17 - docs, demo, and a clean 1.1.0 build
 
 ### 1. What was done
