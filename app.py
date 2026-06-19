@@ -39,9 +39,11 @@ if os.environ.get("CITEFINDER_PG", "").lower() == "bundled":
     pgserver.ensure_ready()
 
 import chats
+import crossref
 from add_source import ingest_pdf
+from metadata import extract_metadata
 from query import answer, is_refusal, test_connection
-from sources import get_source, confirm_source, cite_source, list_sources_for_chat
+from sources import get_source, confirm_source, cite_source, list_sources_for_chat, delete_source
 from citations import format_locator
 from appdata import uploads_dir
 from settings import llm_public, save_llm, is_llm_configured
@@ -53,6 +55,14 @@ WEB_DIR = os.path.join(os.path.dirname(__file__), "web")
 UPLOAD_DIR = str(uploads_dir())
 
 app = FastAPI(title="CiteFinder")
+
+# Warm the embedding model in the background at boot so the FIRST upload doesn't
+# pay the one-time cold start (ONNX session init, model download on a fresh
+# machine). Daemon thread: never blocks startup or shutdown, and embedder.warmup
+# is self-guarded if a real embed beats it to the load.
+import threading
+import embedder
+threading.Thread(target=embedder.warmup, name="embed-warmup", daemon=True).start()
 
 
 # --- request bodies ----------------------------------------------------------
@@ -72,10 +82,11 @@ class Confirm(BaseModel):
     author: str
     title: str | None = None
     year: str | None = None
+    work_type: str = "book"             # book | article | website
+    meta: dict | None = None            # type-specific fields (publisher, journal, …)
 
 
 class Cite(BaseModel):
-    page: int
     style: str = "APA"
 
 
@@ -95,6 +106,10 @@ class TestConn(BaseModel):
 
 class PullModel(BaseModel):
     model: str
+
+
+class DoiLookup(BaseModel):
+    doi: str
 
 
 # --- upload helper -----------------------------------------------------------
@@ -209,6 +224,14 @@ def api_upload(chat_id: int, files: list[UploadFile] = File(...)):
     dest = os.path.join(UPLOAD_DIR, str(chat_id))
     os.makedirs(dest, exist_ok=True)
 
+    # De-dupe by filename within the chat: a chat shouldn't hold two copies of the
+    # same document (a re-upload, or the same file picked twice in a folder). We
+    # match the incoming basename against the names already ingested here and skip
+    # a repeat instead of creating a redundant second Source. `seen` also catches a
+    # duplicate that appears twice within THIS batch, before its first copy is
+    # committed to the DB.
+    seen = {s["filename"] for s in list_sources_for_chat(chat_id)}
+
     report = []
     for up in files:
         name = os.path.basename(up.filename or "")
@@ -218,18 +241,41 @@ def api_upload(chat_id: int, files: list[UploadFile] = File(...)):
             up.file.close()
             continue
 
-        # Never overwrite an existing upload: two PDFs that share a basename
-        # (different subfolders of a folder upload, or a re-upload) each get a
-        # distinct on-disk name, so no file's bytes are clobbered and each
-        # becomes its own Source with an accurate Locator.
+        if name in seen:
+            report.append({"status": "skipped_duplicate", "filename": name,
+                           "chunks": 0,
+                           "reason": "a file with this name is already in this chat"})
+            up.file.close()
+            continue
+        seen.add(name)
+
+        # Backstop against an on-disk clobber even after the dedupe above (e.g. a
+        # name freed by a deleted Source whose file lingered): give a colliding
+        # basename a distinct on-disk name so no file's bytes are overwritten.
         name = _unique_name(dest, name)
         path = os.path.join(dest, name)
         with open(path, "wb") as f:
             shutil.copyfileobj(up.file, f)
         up.file.close()
 
+        # Auto-extract a metadata GUESS from the PDF (title/author/year) so the
+        # "confirm details" form opens pre-filled instead of blank — the intent in
+        # ADR 0003 ("auto-extracted as a guess; confirmation deferred"). It is
+        # stored UNCONFIRMED: PDF metadata is often empty or wrong (the embedded
+        # year is the file's creation date, not the publication year), so it never
+        # auto-unlocks a citation — the student verifies it. A bad metadata block
+        # must not abort ingest, hence the guard.
+        guess = {}
+        try:
+            guess = extract_metadata(path)
+        except Exception:
+            pass
+
         result = ingest_pdf(path, user_id=DEFAULT_USER, chat_id=chat_id,
-                            kind="work", confirmed=False)
+                            kind="work", confirmed=False,
+                            title=(guess.get("title") or None),
+                            author=(guess.get("author") or None),
+                            year=(guess.get("year") or None))
         report.append({
             "status": result["status"],
             "filename": result["filename"],
@@ -299,24 +345,53 @@ def api_get_source(source_id: int):
     return src
 
 
+@app.delete("/api/sources/{source_id}")
+def api_delete_source(source_id: int):
+    """Remove a single file from a chat: its Source + chunks (DB cascade) and the
+    uploaded PDF on disk. Past answers keep their stored Locators (a snapshot)."""
+    src = delete_source(source_id)
+    if src is None:
+        raise HTTPException(status_code=404, detail="No such source.")
+    if src["filename"]:
+        path = os.path.join(UPLOAD_DIR, str(src["chat_id"]), src["filename"])
+        if os.path.isfile(path):
+            os.remove(path)
+    return {"deleted": source_id}
+
+
 @app.post("/api/sources/{source_id}/confirm")
 def api_confirm(source_id: int, body: Confirm):
     try:
-        src = confirm_source(source_id, author=body.author,
-                             title=body.title, year=body.year)
+        src = confirm_source(source_id, author=body.author, title=body.title,
+                             year=body.year, work_type=body.work_type, meta=body.meta)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     return src
 
 
+@app.post("/api/lookup-doi")
+def api_lookup_doi(body: DoiLookup):
+    """Resolve a DOI to citation metadata via CrossRef (the "Auto-fill from DOI"
+    button). Returns the normalized fields for the confirm form to pre-fill; the
+    student still verifies and saves. Sync def → runs in the threadpool (network
+    call). Only the DOI leaves the machine (ADR 0002)."""
+    try:
+        return crossref.lookup_doi(body.doi)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
 @app.post("/api/sources/{source_id}/cite")
 def api_cite(source_id: int, body: Cite):
     try:
-        citation = cite_source(source_id, page=body.page, style=body.style)
+        citation = cite_source(source_id, style=body.style)
     except ValueError as e:
         # Unconfirmed (or notes) — the UI should show the confirm step.
         raise HTTPException(status_code=409, detail=str(e))
-    return {"citation": citation, "style": body.style.upper(), "page": body.page}
+    # citation is {"in_text", "reference"}; the UI shows both.
+    return {"citation": citation, "style": body.style.upper()}
 
 
 # --- settings (LLM choice) ---------------------------------------------------

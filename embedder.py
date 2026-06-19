@@ -72,9 +72,23 @@ def _model_files():
         onnx, tok = base / "model.onnx", base / "tokenizer.json"
         if onnx.exists() and tok.exists():
             return str(onnx), str(tok)
+
+    # HF-hub fallback (dev). Try the LOCAL cache first (local_files_only=True): a
+    # cache hit returns instantly with NO network call. Only if the file isn't
+    # cached do we hit the hub to download it. Without this, hf_hub_download makes
+    # a network HEAD request on every cold start to revalidate the etag — seconds
+    # of avoidable latency on the first embed (and it fails offline). See the
+    # "unauthenticated requests to HF Hub" warning this removes.
     cache = _model_cache_dir()
-    return (hf_hub_download(REPO, filename="onnx/model.onnx", cache_dir=cache),
-            hf_hub_download(REPO, filename="tokenizer.json", cache_dir=cache))
+
+    def _hf(filename):
+        try:
+            return hf_hub_download(REPO, filename=filename, cache_dir=cache,
+                                   local_files_only=True)
+        except Exception:
+            return hf_hub_download(REPO, filename=filename, cache_dir=cache)
+
+    return _hf("onnx/model.onnx"), _hf("tokenizer.json")
 
 
 def _load():
@@ -91,6 +105,14 @@ def _load():
 
     _session = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
     _input_names = {i.name for i in _session.get_inputs()}
+
+
+def warmup():
+    """Load the model NOW (e.g. on server startup, in a background thread) so the
+    first real embed call doesn't pay the one-time cold start — session init plus,
+    on a fresh machine, the model download. Pure latency hiding; safe to call more
+    than once (the load is guarded). No DB or network dependency once cached."""
+    _load()
 
 
 def _embed_batch(texts):

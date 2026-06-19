@@ -19,8 +19,10 @@ const API = {
     return r.json();
   },
   async source(id) { return get(`/api/sources/${id}`); },
+  async deleteSource(id) { return del(`/api/sources/${id}`); },
   async confirm(id, body) { return post(`/api/sources/${id}/confirm`, body); },
-  async cite(id, page, style) { return post(`/api/sources/${id}/cite`, { page, style }); },
+  async cite(id, style) { return post(`/api/sources/${id}/cite`, { style }); },
+  async lookupDoi(doi) { return post(`/api/lookup-doi`, { doi }); },
   async getSettings() { return get("/api/settings"); },
   async putSettings(body) { return put("/api/settings", body); },
   async testConn(body) { return post("/api/settings/test", body); },
@@ -446,6 +448,42 @@ async function openFilesModal(chatId) {
   body.querySelectorAll(".file-confirm").forEach((btn) => {
     btn.onclick = () => openFileConfirm(body, parseInt(btn.dataset.id, 10), sources);
   });
+  body.querySelectorAll(".file-delete").forEach((btn) => {
+    btn.onclick = () => confirmDeleteFile(body, parseInt(btn.dataset.id, 10), sources, chatId);
+  });
+}
+
+/* Remove one file from the chat (Source + chunks + the PDF on disk). Past answers
+   keep their stored Locators — deleting the file only stops future retrieval. */
+function confirmDeleteFile(body, sourceId, sources, chatId) {
+  const src = sources.find((s) => s.id === sourceId) || {};
+  const name = src.title || src.filename || "this file";
+  const cbody = document.createElement("div");
+  cbody.className = "confirm-box";
+  cbody.innerHTML = `
+    <p class="confirm-text">Remove “${esc(name)}” from this chat? Its text and embeddings are deleted, so it won't be searched anymore. Answers you already got keep their references. This can't be undone.</p>
+    <div class="confirm-actions">
+      <button class="btn btn-quiet" id="fd-cancel">Cancel</button>
+      <button class="btn btn-danger" id="fd-go">${icon("i-trash")} Remove file</button>
+    </div>`;
+  const m = modal("Remove file", cbody);
+  cbody.querySelector("#fd-cancel").onclick = m.close;
+  cbody.querySelector("#fd-go").onclick = async () => {
+    const go2 = cbody.querySelector("#fd-go");
+    go2.disabled = true;
+    try {
+      await API.deleteSource(sourceId);
+      m.close();
+      body.querySelector(`#file-${sourceId}`)?.remove();
+      const i = sources.findIndex((s) => s.id === sourceId);
+      if (i >= 0) sources.splice(i, 1);
+      if (!sources.length) {
+        body.innerHTML = `<div class="files-empty">${icon("i-file")}<span>No files left. Close this and use “Add files” or “Add folder”.</span></div>`;
+      }
+      toast("File removed.", "ok");
+      refreshFilesCount(chatId);
+    } catch (e) { toast(e.message, "err"); go2.disabled = false; }
+  };
 }
 
 function fileRow(s) {
@@ -464,7 +502,7 @@ function fileRow(s) {
           <span class="file-sub">${esc(s.filename)} · ${s.n_chunks} chunks</span>
         </div>
       </div>
-      <div class="file-right">${badge}${action}</div>
+      <div class="file-right">${badge}${action}<button class="btn btn-quiet file-delete" data-id="${s.id}" title="Remove this file">${icon("i-trash")}</button></div>
     </div>`;
 }
 
@@ -473,11 +511,16 @@ function openFileConfirm(body, sourceId, sources) {
   const src = sources.find((s) => s.id === sourceId) || {};
   if (row.querySelector(".cite-panel")) { row.querySelector(".cite-panel").remove(); return; }
   const form = confirmForm({
-    source: { id: sourceId, author: src.author, title: src.title, year: src.year },
+    source: { id: sourceId, author: src.author, title: src.title, year: src.year,
+              work_type: src.work_type, cite_meta: src.cite_meta, doi: src.doi },
     onConfirmed: (updated) => {
+      row.querySelector(".cite-panel")?.remove();   // collapse the form on success
       const right = row.querySelector(".file-right");
+      // Keep the delete button; just swap the badge/action to "citable".
+      const del = right.querySelector(".file-delete");
       right.innerHTML = `<span class="fbadge ok">${icon("i-check")} citable</span>`;
-      src.confirmed = true;
+      if (del) right.appendChild(del);
+      Object.assign(src, updated);                  // so re-opening shows saved values
       toast(`"${updated.title}" confirmed. Citable in any style.`, "ok");
     },
     onCancel: () => row.querySelector(".cite-panel")?.remove(),
@@ -606,25 +649,117 @@ async function openCitePanel(locEl, a) {
   try { src = await API.source(a.source_id); }
   catch (e) { slot.innerHTML = `<div class="cite-panel"><span class="panel-err">${esc(e.message)}</span></div>`; return; }
 
-  if (src.confirmed) buildStylePicker(slot, a.source_id, a.page, src);
+  if (src.confirmed) buildStylePicker(slot, a.source_id, src);
   else buildConfirmForm(slot, a, src);
 }
 
-// Reusable confirm form (author/title/year). Used by the locator cite flow and
-// the files modal. Returns a .cite-panel node; callers handle what comes next.
+// The work types CiteFinder can format, and the extra fields each needs beyond
+// the shared author/title/year. Mirrors citations._META_FIELDS server-side.
+const WORK_TYPES = [
+  { id: "book", label: "Book" },
+  { id: "article", label: "Journal article" },
+  { id: "website", label: "Website" },
+];
+const TYPE_FIELDS = {
+  book: [
+    { k: "publisher", label: "Publisher", ph: "e.g. Academic Press" },
+    { k: "place", label: "Place of publication", ph: "e.g. New York" },
+    { k: "edition", label: "Edition (only if not the first)", ph: "e.g. 2nd ed." },
+  ],
+  article: [
+    { k: "journal", label: "Journal title", ph: "e.g. Journal of Technology" },
+    { k: "volume", label: "Volume", ph: "e.g. 14" },
+    { k: "issue", label: "Issue", ph: "e.g. 2" },
+    { k: "pages", label: "Pages", ph: "e.g. 112–125" },
+    { k: "doi", label: "DOI or URL", ph: "e.g. 10.1016/… or doi.org" },
+  ],
+  website: [
+    { k: "site_name", label: "Website name", ph: "e.g. WHO" },
+    { k: "url", label: "URL", ph: "e.g. who.int" },
+    { k: "pub_date", label: "Publication date (month & day)", ph: "e.g. March 15" },
+    { k: "accessed", label: "Date accessed", ph: "", type: "date" },
+  ],
+};
+
+function typeGroupHtml(type, meta) {
+  const fields = TYPE_FIELDS[type].map((f) => {
+    const val = esc((meta && meta[f.k]) || "");
+    return `<div class="field"><label>${esc(f.label)}</label>
+      <input class="f-meta" data-mk="${f.k}" type="${f.type || "text"}" placeholder="${esc(f.ph)}" value="${val}" /></div>`;
+  }).join("");
+  return `<div class="type-fields tf-${type} hidden">${fields}</div>`;
+}
+
+// Reusable confirm form: type picker + author/title/year + the chosen type's
+// fields. Used by the locator cite flow and the files modal. Returns a
+// .cite-panel node; callers handle what comes next.
 function confirmForm({ source, onConfirmed, onCancel }) {
   const panel = document.createElement("div");
   panel.className = "cite-panel";
+  let type = source.work_type || "book";
+  const meta = source.cite_meta || {};
   panel.innerHTML = `
     <div class="cite-panel-title">Confirm details to cite. Locked once saved.</div>
+    <div class="field"><label>Auto-fill from DOI (looks it up online)</label>
+      <div class="doi-row">
+        <input class="f-doi" placeholder="10.1016/j.x.2019.01.002" value="${esc(source.doi || "")}" />
+        <button type="button" class="btn btn-ghost f-doi-go">${icon("i-spark")} Auto-fill</button>
+      </div>
+      <span class="doi-hint hidden"></span>
+    </div>
+    <div class="field"><label>Type of work</label>
+      <div class="style-chips type-chips">
+        ${WORK_TYPES.map((w) => `<button type="button" class="chip" data-type="${w.id}">${esc(w.label)}</button>`).join("")}
+      </div>
+    </div>
     <div class="field"><label>Author</label><input class="f-author" placeholder="e.g. Khan, H. M. H." value="${esc(source.author || "")}" /></div>
     <div class="field"><label>Title</label><input class="f-title" placeholder="Work title" value="${esc(source.title || "")}" /></div>
     <div class="field-row"><div class="field"><label>Year</label><input class="f-year" placeholder="2025" value="${esc(source.year || "")}" /></div></div>
+    ${WORK_TYPES.map((w) => typeGroupHtml(w.id, meta)).join("")}
     <div class="cite-panel-actions">
       <button class="btn btn-primary f-save">${icon("i-check")} Confirm</button>
       <button class="btn btn-quiet f-cancel">Cancel</button>
       <span class="panel-err hidden f-err"></span>
     </div>`;
+
+  const showType = (t) => {
+    type = t;
+    panel.querySelectorAll(".type-chips .chip").forEach((c) => c.classList.toggle("sel", c.dataset.type === t));
+    panel.querySelectorAll(".type-fields").forEach((g) => g.classList.toggle("hidden", !g.classList.contains(`tf-${t}`)));
+  };
+  panel.querySelectorAll(".type-chips .chip").forEach((c) => (c.onclick = () => showType(c.dataset.type)));
+  showType(type);
+
+  // Auto-fill from DOI: look the DOI up via CrossRef and populate the form with
+  // authoritative metadata the student then verifies (still confirmed manually).
+  panel.querySelector(".f-doi-go").onclick = async () => {
+    const doi = panel.querySelector(".f-doi").value.trim();
+    const hint = panel.querySelector(".doi-hint");
+    const go = panel.querySelector(".f-doi-go");
+    hint.classList.add("hidden");
+    if (!doi) { hint.textContent = "Enter a DOI first (it's usually on the article's first page)."; hint.className = "doi-hint err"; return; }
+    go.disabled = true; const orig = go.innerHTML; go.innerHTML = `<span class="mini-spin"></span> Looking up…`;
+    try {
+      const m = await API.lookupDoi(doi);
+      const wt = m.work_type || "article";
+      showType(wt);
+      if (m.author) panel.querySelector(".f-author").value = m.author;
+      if (m.title) panel.querySelector(".f-title").value = m.title;
+      if (m.year) panel.querySelector(".f-year").value = m.year;
+      const grp = panel.querySelector(`.tf-${wt}`);
+      Object.entries(m.meta || {}).forEach(([k, v]) => {
+        const inp = grp && grp.querySelector(`.f-meta[data-mk="${k}"]`);
+        if (inp && v) inp.value = v;
+      });
+      hint.textContent = m.title ? `Found: ${m.title} — check the details, then Confirm.` : "Found a record — please verify.";
+      hint.className = "doi-hint ok";
+    } catch (e) {
+      hint.textContent = e.message; hint.className = "doi-hint err";
+    } finally {
+      go.disabled = false; go.innerHTML = orig;
+    }
+  };
+
   panel.querySelector(".f-cancel").onclick = () => onCancel && onCancel();
   panel.querySelector(".f-save").onclick = async () => {
     const author = panel.querySelector(".f-author").value.trim();
@@ -635,10 +770,16 @@ function confirmForm({ source, onConfirmed, onCancel }) {
       err.textContent = "Author, year, and a real title are all required to cite.";
       err.classList.remove("hidden"); return;
     }
+    // Only the visible type's fields are sent (server keeps just those anyway).
+    const metaOut = {};
+    panel.querySelector(`.tf-${type}`).querySelectorAll(".f-meta").forEach((inp) => {
+      const v = inp.value.trim();
+      if (v) metaOut[inp.dataset.mk] = v;
+    });
     const save = panel.querySelector(".f-save");
     save.disabled = true; save.innerHTML = `<span class="mini-spin"></span> Saving`;
     try {
-      const updated = await API.confirm(source.id, { author, title, year });
+      const updated = await API.confirm(source.id, { author, title, year, work_type: type, meta: metaOut });
       if (!updated.confirmed) throw new Error("Still locator-only. Give a real title (not the file name), author, and year.");
       onConfirmed && onConfirmed(updated);
     } catch (e) {
@@ -651,11 +792,12 @@ function confirmForm({ source, onConfirmed, onCancel }) {
 
 function buildConfirmForm(slot, a, src) {
   const form = confirmForm({
-    source: { id: a.source_id, author: src.author, title: src.title || a.title, year: src.year },
+    source: { id: a.source_id, author: src.author, title: src.title || a.title, year: src.year,
+              work_type: src.work_type, cite_meta: src.cite_meta, doi: src.doi },
     onConfirmed: (updated) => {
       a.confirmed = true;
       toast(`"${updated.title}" confirmed. Now citable in any style.`, "ok");
-      buildStylePicker(slot, a.source_id, a.page, updated);
+      buildStylePicker(slot, a.source_id, updated);
     },
     onCancel: () => { slot.innerHTML = ""; slot.dataset.open = "0"; },
   });
@@ -663,7 +805,7 @@ function buildConfirmForm(slot, a, src) {
   slot.appendChild(form);
 }
 
-function buildStylePicker(slot, sourceId, page, src) {
+function buildStylePicker(slot, sourceId, src) {
   const panel = document.createElement("div");
   panel.className = "cite-panel";
   panel.innerHTML = `
@@ -696,9 +838,10 @@ function buildStylePicker(slot, sourceId, page, src) {
     const err = panel.querySelector("#c-err");
     err.classList.add("hidden");
     try {
-      const { citation, style: st } = await API.cite(sourceId, page, style);
-      out.innerHTML = `<div class="citation-style">${esc(st)} · p. ${esc(String(page))}</div>
-        <div class="citation-text">${esc(citation)}</div>`;
+      const { citation, style: st } = await API.cite(sourceId, style);
+      out.innerHTML = `<div class="citation-style">${esc(st)}</div>
+        <div class="cite-line"><span class="cite-lbl">In-text</span><span class="citation-text">${esc(citation.in_text)}</span></div>
+        <div class="cite-line"><span class="cite-lbl">Reference list</span><span class="citation-text">${esc(citation.reference)}</span></div>`;
       out.classList.remove("hidden");
     } catch (e) { err.textContent = e.message; err.classList.remove("hidden"); }
   };
@@ -1009,9 +1152,11 @@ async function handleUpload(chatId, fileList, kind) {
     const res = await API.upload(chatId, pdfs);
     dismiss();
     const skipped = res.total - res.stored;
+    const dupes = (res.files || []).filter((f) => f.status === "skipped_duplicate").length;
     let msg = `Added ${res.stored} ${res.stored === 1 ? "file" : "files"} · ${res.chunks} chunks`;
-    if (skipped > 0) msg += ` · ${skipped} skipped`;
-    toast(msg, "ok");
+    if (dupes > 0) msg += ` · ${dupes} already in this chat`;
+    if (skipped - dupes > 0) msg += ` · ${skipped - dupes} skipped`;
+    toast(msg, skipped && !res.stored ? "err" : "ok");
     await loadThread(chatId);   // empty state -> ready, ask immediately
     refreshFilesCount(chatId);
   } catch (e) {
