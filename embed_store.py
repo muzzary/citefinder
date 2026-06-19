@@ -6,6 +6,11 @@ def store_source(title, filename, user_id="user_1", author=None, year=None,
     """
     Insert one source row, return its new id.
 
+    NOTE: the APP ingest path uses `store_source_and_chunks` (atomic). This
+    standalone insert + a separate `store_chunks` is kept only for the eval /
+    benchmark scripts (evaluate.py, bench_corpus.py); don't use it for new app
+    code — it reopens the source-then-chunks race the atomic version closes.
+
     kind      : 'work' (citable) or 'notes' (locator-only). See ADR 0001/0003.
     confirmed : student has verified this Work's metadata, so a Citation may be
                 offered. Notes are never confirmed (they are locator-only).

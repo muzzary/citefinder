@@ -229,8 +229,6 @@ input, textarea { font-family: inherit; color: inherit; }
 .main-back { display: none; }
 @media (max-width: 820px) { .main-back { display: inline-flex; } }
 .main-title { font-family: var(--font-display); font-weight: 600; font-size: 16.5px; letter-spacing: -0.02em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.scope-pill { display: inline-flex; align-items: center; gap: 7px; font-family: var(--font-mono); font-size: 11px; color: var(--text-3); padding: 5px 10px; border: 1px solid var(--line); border-radius: 20px; }
-.scope-pill .dot { background: var(--accent); }
 
 /* messages scroll area */
 .thread { flex: 1; overflow-y: auto; min-height: 0; padding: 30px clamp(18px, 5vw, 60px); }

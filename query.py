@@ -7,8 +7,9 @@ from embedder import embed
 from sources import list_sources_for_chat
 
 # same embedding model as ingestion — MUST match, or vectors won't compare.
-# Embeddings are ALWAYS local (ONNX all-MiniLM-L6-v2, CPU) — they never use the
-# hosted LLM, so ingestion costs zero LLM tokens regardless of the config below.
+# Embeddings are ALWAYS local (ONNX e5-small-v2, CPU — see embedder.py) — they
+# never use the hosted LLM, so ingestion costs zero LLM tokens regardless of the
+# config below.
 
 # The LLM boundary: local-by-default, hosted opt-in (ADR 0002). The endpoint is
 # resolved by settings.llm_config() with precedence env (CITEFINDER_LLM_*/.env) >

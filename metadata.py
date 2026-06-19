@@ -34,7 +34,6 @@ def extract_metadata(pdf_path):
     # Year: PDF dates look like "D:20250115..." - try to find a 4-digit year.
     year = ""
     raw_date = (info.get("/CreationDate") or "")
-    import re
     match = re.search(r"(19|20)\d{2}", str(raw_date))
     if match:
         year = match.group(0)
