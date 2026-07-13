@@ -9,9 +9,11 @@ __pycache__/
 # Test data (don't commit your FYP PDF)
 *.pdf
 
-# OS
+# OS / editor
 Thumbs.db
 .DS_Store
+*.swp
+*.tmp
 
 # Bundled/portable binaries — downloaded or built, never committed (Phase 12/16):
 # portable Postgres, the compiled pgvector, and download archives.
