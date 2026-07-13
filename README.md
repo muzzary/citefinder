@@ -2,6 +2,11 @@
 
 # CiteFinder
 
+![Python](https://img.shields.io/badge/Python-3.11-3776AB?logo=python&logoColor=white)
+![PostgreSQL](https://img.shields.io/badge/PostgreSQL-pgvector-4169E1?logo=postgresql&logoColor=white)
+![Local-first](https://img.shields.io/badge/Local--first-No%20cloud%20required-2E7D32)
+![Platform](https://img.shields.io/badge/Platform-Windows-0078D6?logo=windows&logoColor=white)
+
 A local-first RAG tool that answers questions **only from your own PDFs**, points to **where** each answer came from (file and page), and turns a source into a **formatted citation** only once you confirm its details. Nothing is invented, and nothing leaves your machine by default.
 
 Drop a folder of readings into a chat, ask in plain English, and get a grounded, tutor-style answer with a **Locator** for every claim, plus an APA / Harvard / IEEE citation on demand.
