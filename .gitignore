@@ -29,3 +29,6 @@ dist/
 # Inno Setup output (Phase 16)
 installer/
 *.log
+
+# Screenshots / branding images kept local
+citepfp.PNG
